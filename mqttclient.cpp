@@ -286,7 +286,16 @@ void MqttClient::publishCommand(const QString &cmd)
 void MqttClient::onCmdTimeout()
 {
     fprintf(stderr, "[GUI] TIMEOUT: no response for '%s'\n", m_pendingCmd.toUtf8().constData());
-    emitLog(QString("No response from HMS (timeout %1s) — check that hms is running on the host.").arg(m_timeoutSec), "error");
+    /* Not "check that hms is running". The usual cause is that it *is*
+       running and has no network yet: hms starts early in the board's boot
+       and the wifi lease lands afterwards, so there is a window where it
+       retries the broker and answers nothing. Saying the wrong thing sends
+       people to look at the wrong end. */
+    emitLog(QString("No answer to '%1' after %2s. HMS may still be starting — "
+                    "it connects to the broker only once the board has a "
+                    "network. Retry in a moment.")
+                .arg(m_pendingCmd.section(' ', 0, 0)).arg(m_timeoutSec),
+            "warning");
     m_pendingCmd.clear();
 }
 
