@@ -21,6 +21,10 @@ class MqttClient : public QObject
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
     Q_PROPERTY(QString broker READ broker CONSTANT)
     Q_PROPERTY(QString serverUserHost READ serverUserHost CONSTANT)
+    /* The QML file picker hardcoded "/home/gemy/" as its starting directory,
+       which is one developer's machine and nobody else's. */
+    Q_PROPERTY(QString homePath READ homePath CONSTANT)
+    Q_PROPERTY(QString serverUploadDir READ serverUploadDir CONSTANT)
 
 public:
     explicit MqttClient(QObject *parent = nullptr);
@@ -30,6 +34,8 @@ public:
     QString statusText() const;
     QString broker() const;
     QString serverUserHost() const;
+    QString homePath() const;
+    QString serverUploadDir() const;
 
 public slots:
     void connectToBroker();
@@ -51,6 +57,21 @@ public slots:
     Q_INVOKABLE void downloadFromServer(const QString &remotePath, const QString &localPath);
     Q_INVOKABLE void pushFilesToGuest(const QString &guestId, const QString &serverPath);
 
+    /* Interactive shell. HMS has served shellopen/shellwrite/shellclose and
+     * streamed shell_out chunks back since it grew shell.c, but nothing here
+     * ever sent those commands or listened for the replies, so the feature was
+     * unreachable from the GUI. */
+    Q_INVOKABLE void shellOpen(const QString &guestId);
+    Q_INVOKABLE void shellWrite(const QString &guestId, const QString &data);
+    Q_INVOKABLE void shellClose(const QString &guestId);
+
+    /* Likewise addfile / addguest: implemented in ota.c, never called. */
+    Q_INVOKABLE void addFileToGuest(const QString &guestId, const QString &serverPath);
+    Q_INVOKABLE void addGuest(const QString &guestId, const QString &ifsServerPath,
+                              const QString &confServerPath, const QString &ip);
+
+    Q_INVOKABLE void ping();
+
     /* Pack files (each at an absolute guest path) into one tar.gz.
      * entries: [ {local: "<laptop path>", dest: "<guest absolute path>"}, ... ]
      * Returns the archive path, or "" on failure. */
@@ -62,6 +83,7 @@ private slots:
 
 public:
     void scheduleReconnect();
+    void onConnectionLost();
     void handleStatusMessage(const QString &payload);
 
 signals:
@@ -83,6 +105,14 @@ signals:
     void genericUploaded(const QString &serverPath);
     void uploadFailed(const QString &localName, const QString &err);
 
+    /* Interactive shell stream from HMS. */
+    void shellOpened(const QString &guest, const QString &msg);
+    void shellOutput(const QString &guest, const QString &data);
+    void shellClosed(const QString &guest, const QString &msg);
+
+    void addFileResult(const QString &guest, bool success, const QString &msg);
+    void addGuestResult(const QString &guest, bool success, const QString &msg);
+
 private:
     void emitLog(const QString &text, const QString &type);
     void setConnected(bool c);
@@ -90,6 +120,7 @@ private:
     void publishOtaCmd(const QString &guestId, const QString &remotePath);
     void publishNoWait(const QString &cmd);
     void startScpUpload(const QString &localFilePath, const QString &remotePath, bool ota);
+    void teardownClient();
     static bool removeDirRecursive(const QString &path);
 
 private:

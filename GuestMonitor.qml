@@ -1,28 +1,39 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Controls.Material
 import QtQuick.Layouts
+import App 1.0
 import "StatsParser.js" as Stats
 
+/*
+ * Live host and guest statistics.
+ *
+ * Same parsing as before (StatsParser.js is untouched), restyled onto the
+ * shared theme with larger type. Two changes beyond looks:
+ *
+ *  - `enabled` is no longer redeclared. Item already has an `enabled` property
+ *    and shadowing it meant "this tab is visible" and "this item accepts input"
+ *    were the same flag, so the page's own controls went dead whenever polling
+ *    was meant to stop. It is `active` now.
+ *  - The stat cards use a Flow, so they wrap instead of being squeezed to
+ *    illegibility on a narrow window.
+ */
 Item {
     id: root
-    Layout.fillWidth: true
-    Layout.fillHeight: true
 
-    /* Set by main.qml: true while this tab is visible and MQTT is connected. */
-    property bool enabled: false
+    property bool active: false
     property bool autoRefresh: true
-    property int pollIntervalMs: 3000
+    property int  pollIntervalMs: 3000
 
     property string guestId: ""
     property string guestName: ""
     property string guestIp: ""
-    property bool guestRunning: false
+    property bool   guestRunning: false
     property string lastUpdated: ""
     property string statusText: ""
-    property bool requestInFlight: false
+    property bool   requestInFlight: false
 
     signal requestStats(string id)
-    signal backRequested()
 
     ListModel { id: hostProcs }
     ListModel { id: guestProcs }
@@ -31,8 +42,6 @@ Item {
     property var guestSnap: null
     property var hostSummary: null
     property var guestSummary: null
-    property var hostView: []
-    property var guestView: []
 
     function fillModel(model, view) {
         model.clear()
@@ -48,8 +57,6 @@ Item {
     }
 
     function setGuest(id, name, ip, running) {
-        /* A fresh click always triggers a fresh request — never silently
-           skip it because of stale in-flight state. */
         requestInFlight = false
         watchdog.stop()
         guestId = id
@@ -58,16 +65,15 @@ Item {
         guestRunning = running
         guestSnap = null
         guestSummary = null
-        guestView = []
         guestProcs.clear()
         statusText = ""
-        if (enabled)
-            refreshNow()
+        if (active) refreshNow()
     }
 
     function onStats(json) {
+        var obj
         try {
-            var obj = JSON.parse(json)
+            obj = JSON.parse(json)
         } catch (e) {
             requestInFlight = false
             watchdog.stop()
@@ -77,11 +83,10 @@ Item {
         requestInFlight = false
         watchdog.stop()
 
-        /* Ignore responses for a guest that is no longer selected. */
         if (obj.guest_id && obj.guest_id !== "" && obj.guest_id !== guestId)
             return
 
-        lastUpdated = new Date().toLocaleTimeString(Qt.locale("en_US"), "hh:mm:ss")
+        lastUpdated = Qt.formatTime(new Date(), "hh:mm:ss")
         statusText = ""
 
         try {
@@ -89,8 +94,7 @@ Item {
             hostSummary = h
             var prevH = hostSnap
             hostSnap = h
-            hostView = Stats.buildView(h, prevH, pollIntervalMs)
-            fillModel(hostProcs, hostView)
+            fillModel(hostProcs, Stats.buildView(h, prevH, pollIntervalMs))
 
             guestRunning = (obj.guest_running === true)
             if (guestRunning && obj.guest && obj.guest !== "") {
@@ -98,107 +102,118 @@ Item {
                 guestSummary = g
                 var prevG = guestSnap
                 guestSnap = g
-                guestView = Stats.buildView(g, prevG, pollIntervalMs)
-                fillModel(guestProcs, guestView)
+                fillModel(guestProcs, Stats.buildView(g, prevG, pollIntervalMs))
             } else {
                 guestSnap = null
                 guestSummary = null
-                guestView = []
                 guestProcs.clear()
             }
-        } catch (e) {
-            statusText = "Parse error: " + e.message
+        } catch (e2) {
+            statusText = "Parse error: " + e2.message
         }
     }
 
     function refreshNow() {
-        if (requestInFlight)
-            return
+        if (requestInFlight) return
         requestInFlight = true
-        statusText = "Fetching..."
+        statusText = "Fetching…"
         watchdog.start()
         requestStats(guestId)
     }
 
-    /* ============================ Small building blocks ============================ */
-
-    component Card: Rectangle {
-        property string label: ""
-        property string value: ""
-        implicitWidth: 200
-        implicitHeight: labelText.implicitHeight + valueText.implicitHeight + 24
-        radius: 6
-        color: "#0d1117"
-        border.color: "#21262d"
-        border.width: 1
-
-        ColumnLayout {
-            anchors.fill: parent
-            anchors.margins: 10
-            spacing: 3
-
-            Text {
-                id: labelText
-                text: label
-                color: "#8b949e"
-                font.pixelSize: 11
-                Layout.fillWidth: true
-            }
-            Text {
-                id: valueText
-                text: value
-                color: "#e6edf3"
-                font.pixelSize: 14
-                font.bold: true
-                wrapMode: Text.WordWrap
-                Layout.fillWidth: true
-                verticalAlignment: Text.AlignTop
-            }
-        }
+    function loadText(s) {
+        if (!s) return "—"
+        if (s.load && s.load.length > 0)
+            return s.load.map(function (v) { return v.toFixed(2) }).join("  ")
+        if (s.cpuBusyPct !== null && s.cpuBusyPct !== undefined)
+            return "busy " + s.cpuBusyPct.toFixed(0) + "%"
+        return "—"
     }
 
-    component RamCard: Rectangle {
+    /* ---------------- building blocks ---------------- */
+
+    component Stat: Rectangle {
         property string label: ""
-        property string usedText: ""
-        property string totalText: ""
-        property real usedBytes: 0
-        property real totalBytes: 0
-        implicitWidth: 300
-        implicitHeight: 58
-        radius: 6
-        color: "#0d1117"
-        border.color: "#21262d"
+        property string value: ""
+        property int minWidth: 170
+
+        implicitWidth: Math.max(minWidth, valueText.implicitWidth + 28)
+        implicitHeight: 74
+        radius: Theme.radiusSmall
+        color: Theme.surfaceSunken
+        border.color: Theme.outline
         border.width: 1
 
         ColumnLayout {
             anchors.fill: parent
-            anchors.margins: 10
+            anchors.margins: 12
             spacing: 4
 
             Text {
                 text: label
-                color: "#8b949e"
-                font.pixelSize: 11
+                color: Theme.textSecondary
+                font.pixelSize: Theme.fontTiny
+                font.weight: Font.DemiBold
             }
             Text {
-                text: usedText + " / " + totalText
-                color: "#e6edf3"
-                font.pixelSize: 14
-                font.bold: true
+                id: valueText
+                text: value
+                color: Theme.textPrimary
+                font.pixelSize: Theme.fontMedium
+                font.weight: Font.DemiBold
+                elide: Text.ElideRight
+                Layout.fillWidth: true
+            }
+        }
+    }
+
+    component RamStat: Rectangle {
+        property string label: "RAM"
+        property real usedBytes: 0
+        property real totalBytes: 0
+
+        readonly property real frac: totalBytes > 0
+            ? Math.min(usedBytes / totalBytes, 1) : 0
+
+        implicitWidth: 260
+        implicitHeight: 74
+        radius: Theme.radiusSmall
+        color: Theme.surfaceSunken
+        border.color: Theme.outline
+        border.width: 1
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 12
+            spacing: 4
+
+            Text {
+                text: label
+                color: Theme.textSecondary
+                font.pixelSize: Theme.fontTiny
+                font.weight: Font.DemiBold
+            }
+            Text {
+                text: totalBytes > 0
+                    ? Stats.fmtBytes(usedBytes) + " / " + Stats.fmtBytes(totalBytes)
+                    : "—"
+                color: Theme.textPrimary
+                font.pixelSize: Theme.fontMedium
+                font.weight: Font.DemiBold
             }
             Rectangle {
                 Layout.fillWidth: true
                 implicitHeight: 6
                 radius: 3
-                color: "#21262d"
-                clip: true
+                color: Theme.surfaceVariant
 
                 Rectangle {
+                    width: parent.width * frac
                     height: parent.height
-                    width: (totalBytes > 0) ? parent.width * Math.min(usedBytes / totalBytes, 1) : 0
                     radius: 3
-                    color: (totalBytes > 0 && usedBytes / totalBytes > 0.9) ? "#da3633"
-                         : (totalBytes > 0 && usedBytes / totalBytes > 0.7) ? "#d29922" : "#238636"
+                    color: frac > 0.9 ? Theme.danger
+                         : frac > 0.7 ? Theme.warning : Theme.success
+                    Behavior on width { NumberAnimation { duration: 220 } }
                 }
             }
         }
@@ -212,276 +227,303 @@ Item {
 
         Rectangle {
             Layout.fillWidth: true
-            implicitHeight: 34
-            radius: 4
-            color: "#0d1117"
+            implicitHeight: Theme.headerHeight
+            radius: Theme.radiusSmall
+            color: Theme.surfaceVariant
 
             RowLayout {
                 anchors.fill: parent
-                anchors.leftMargin: 12; anchors.rightMargin: 12
-                spacing: 8
+                anchors.leftMargin: Theme.spacing
+                anchors.rightMargin: Theme.spacing
+                spacing: Theme.spacingTight
 
-                Text { text: "PID";   color: "#8b949e"; font.bold: true; font.pixelSize: 13; Layout.preferredWidth: 90;  Layout.minimumWidth: 90 }
-                Text { text: "CPU%";  color: "#8b949e"; font.bold: true; font.pixelSize: 13; Layout.preferredWidth: 100; Layout.minimumWidth: 100 }
-                Text { text: "MEM";   color: "#8b949e"; font.bold: true; font.pixelSize: 13; Layout.preferredWidth: 100; Layout.minimumWidth: 100 }
-                Text { text: "Name";  color: "#8b949e"; font.bold: true; font.pixelSize: 13; Layout.fillWidth: true }
+                Text { text: "PID";  color: Theme.textSecondary; font.pixelSize: Theme.fontTiny; font.weight: Font.DemiBold; Layout.preferredWidth: 90 }
+                Text { text: "CPU%"; color: Theme.textSecondary; font.pixelSize: Theme.fontTiny; font.weight: Font.DemiBold; Layout.preferredWidth: 90 }
+                Text { text: "MEM";  color: Theme.textSecondary; font.pixelSize: Theme.fontTiny; font.weight: Font.DemiBold; Layout.preferredWidth: 110 }
+                Text { text: "PROCESS"; color: Theme.textSecondary; font.pixelSize: Theme.fontTiny; font.weight: Font.DemiBold; Layout.fillWidth: true }
             }
         }
 
         Rectangle {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            radius: 4
-            color: "#0d1117"
+            radius: Theme.radiusSmall
+            color: Theme.surfaceSunken
+            border.color: Theme.outline
+            border.width: 1
+            clip: true
 
             ListView {
                 id: procList
                 anchors.fill: parent
-                anchors.margins: 4
+                anchors.margins: 6
                 model: procModel
-                spacing: 2
+                spacing: 1
                 clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-                delegate: RowLayout {
+                delegate: Item {
                     width: procList.width - 8
-                    implicitHeight: 30
-                    spacing: 8
+                    height: 32
 
-                    Text { text: String(model.pid); color: "#e6edf3"; font.pixelSize: 13; Layout.preferredWidth: 90;  Layout.minimumWidth: 90 }
-                    Text {
-                        text: (model.cpu < 0) ? "\u2013" : model.cpu.toFixed(1)
-                        color: (model.cpu < 0) ? "#8b949e" : (model.cpu > 50 ? "#da3633" : model.cpu > 10 ? "#d29922" : "#7ee787")
-                        font.pixelSize: 13; font.bold: true
-                        Layout.preferredWidth: 100; Layout.minimumWidth: 100
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: Theme.spacingTight
+                        anchors.rightMargin: Theme.spacingTight
+                        spacing: Theme.spacingTight
+
+                        Text {
+                            text: String(model.pid)
+                            color: Theme.textSecondary
+                            font.family: Theme.monoFamily
+                            font.pixelSize: Theme.fontSmall
+                            Layout.preferredWidth: 90
+                        }
+                        Text {
+                            text: (model.cpu < 0) ? "—" : model.cpu.toFixed(1)
+                            color: (model.cpu < 0) ? Theme.textDisabled
+                                 : model.cpu > 50 ? Theme.danger
+                                 : model.cpu > 10 ? Theme.warning : Theme.success
+                            font.family: Theme.monoFamily
+                            font.pixelSize: Theme.fontSmall
+                            font.weight: Font.DemiBold
+                            Layout.preferredWidth: 90
+                        }
+                        Text {
+                            text: (model.mem < 0) ? "—" : Stats.fmtBytes(model.mem)
+                            color: Theme.textSecondary
+                            font.family: Theme.monoFamily
+                            font.pixelSize: Theme.fontSmall
+                            Layout.preferredWidth: 110
+                        }
+                        Text {
+                            text: model.name
+                            color: Theme.textPrimary
+                            font.pixelSize: Theme.fontSmall
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                        }
                     }
-                    Text { text: (model.mem < 0) ? "\u2013" : Stats.fmtBytes(model.mem); color: "#8b949e"; font.pixelSize: 13; Layout.preferredWidth: 100; Layout.minimumWidth: 100 }
-                    Text { text: model.name; color: "#e6edf3"; font.pixelSize: 13; Layout.fillWidth: true; elide: Text.ElideRight }
                 }
 
                 Text {
                     anchors.centerIn: parent
                     text: emptyText
-                    color: "#8b949e"
-                    font.pixelSize: 12
+                    color: Theme.textDisabled
+                    font.pixelSize: Theme.fontBody
                     visible: procModel.count === 0
                 }
             }
         }
     }
 
-    /* ============================ Page layout ============================ */
+    /* ---------------- page ---------------- */
 
     ColumnLayout {
         anchors.fill: parent
-        spacing: 10
+        spacing: Theme.spacing
 
         RowLayout {
             Layout.fillWidth: true
-            spacing: 10
+            spacing: Theme.spacingTight
 
-            Button {
-                text: "\u2190 Back"
-                implicitWidth: 90; implicitHeight: 32
-                onClicked: root.backRequested()
-                contentItem: Text { text: parent.text; color: "#e6edf3"; font.bold: true; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                background: Rectangle { color: parent.hovered ? "#1f6feb" : "#21262d"; radius: 6; border.color: "#30363d"; border.width: 1 }
+            SectionTitle {
+                Layout.fillWidth: true
+                title: "System monitor"
+                subtitle: root.guestId !== ""
+                    ? "Hypervisor host and guest " + root.guestId +
+                      (root.guestIp !== "" && root.guestIp !== "-" ? " (" + root.guestIp + ")" : "")
+                    : "Hypervisor host only — pick a guest from the Guests page to add it."
             }
-
-            Item { Layout.fillWidth: true; Layout.preferredHeight: 1 }
 
             Text {
                 text: root.lastUpdated !== "" ? "Updated " + root.lastUpdated : ""
-                color: "#8b949e"; font.pixelSize: 11
+                color: Theme.textSecondary
+                font.pixelSize: Theme.fontSmall
+                Layout.alignment: Qt.AlignVCenter
             }
 
-            Button {
-                text: root.autoRefresh ? "Auto: ON" : "Auto: OFF"
-                implicitWidth: 90; implicitHeight: 32
-                onClicked: root.autoRefresh = !root.autoRefresh
-                contentItem: Text { text: parent.text; color: root.autoRefresh ? "#7ee787" : "#8b949e"; font.bold: true; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                background: Rectangle { color: parent.hovered ? "#1f6feb" : "#21262d"; radius: 6; border.color: "#30363d"; border.width: 1 }
+            Switch {
+                text: "Auto"
+                checked: root.autoRefresh
+                font.pixelSize: Theme.fontBody
+                Material.foreground: Theme.textPrimary
+                Material.accent: Theme.primary
+                onToggled: root.autoRefresh = checked
             }
 
-            Button {
+            FilledButton {
                 text: root.statusText !== "" ? root.statusText : "Refresh"
-                implicitWidth: 100; implicitHeight: 32
-                enabled: root.enabled
+                implicitHeight: Theme.controlHeight
+                implicitWidth: 130
+                font.pixelSize: Theme.fontBody
+                enabled: root.active && !root.requestInFlight
+                accent: Theme.primary
                 onClicked: root.refreshNow()
-                contentItem: Text { text: parent.text; color: "#ffffff"; font.bold: true; font.pixelSize: 12; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
-                background: Rectangle { color: parent.enabled ? (parent.hovered ? "#2ea043" : "#238636") : "#21262d"; radius: 6 }
             }
         }
 
-        Rectangle {
+        ScrollView {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            color: "#161b22"
-            radius: 8
-            border.color: "#30363d"
-            border.width: 1
+            contentWidth: availableWidth
             clip: true
 
-            ScrollView {
-                anchors.fill: parent
-                anchors.margins: 10
-                clip: true
+            ColumnLayout {
+                width: root.width
+                spacing: Theme.spacing
 
-                contentItem: Flickable {
-                    id: scrollFlick
-                    contentWidth: scrollCol.width
-                    contentHeight: scrollCol.height
+                /* ---- host ---- */
+                AppCard {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 400
 
                     ColumnLayout {
-                        id: scrollCol
-                        width: scrollFlick.width
-                        spacing: 14
+                        anchors.fill: parent
+                        spacing: Theme.spacingTight
 
-                    /* ---------- Host section ---------- */
-                    Text {
-                        text: "Hypervisor Host"
-                        color: "#e6edf3"; font.pixelSize: 13; font.bold: true
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 8
-
-                        Card { label: "Hostname"; value: root.hostSummary ? (root.hostSummary.hostname || "\u2013") : "\u2013" }
-                        Card {
-                            label: "Load"
-                            value: (root.hostSummary && root.hostSummary.load.length > 0)
-                                ? root.hostSummary.load.map(function (v) { return v.toFixed(2) }).join(" / ")
-                                : (root.hostSummary && root.hostSummary.cpuBusyPct !== null)
-                                    ? "busy " + root.hostSummary.cpuBusyPct.toFixed(0) + "%"
-                                    : "\u2013"
-                        }
-                        Card {
-                            label: "CPU(s)"
-                            value: root.hostSummary && root.hostSummary.cpus > 0
-                                ? String(root.hostSummary.cpus) + (root.hostSummary.threads > 0 ? " \u00b7 " + root.hostSummary.threads + " threads" : "")
-                                : "\u2013"
-                        }
-                        Card {
-                            label: "Kernel"
-                            Layout.preferredWidth: 280
-                            value: root.hostSummary ? (root.hostSummary.kernel || "\u2013") : "\u2013"
-                        }
-                        RamCard {
-                            label: "RAM"
-                            usedText: (root.hostSummary && root.hostSummary.ram.used !== null) ? Stats.fmtBytes(root.hostSummary.ram.used) : "\u2013"
-                            totalText: (root.hostSummary && root.hostSummary.ram.total !== null) ? Stats.fmtBytes(root.hostSummary.ram.total) : "\u2013"
-                            usedBytes: (root.hostSummary && root.hostSummary.ram.used) ? root.hostSummary.ram.used : 0
-                            totalBytes: (root.hostSummary && root.hostSummary.ram.total) ? root.hostSummary.ram.total : 0
-                        }
-                    }
-
-                    ProcTable {
-                        id: hostProcTable
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 200
-                        procModel: hostProcs
-                        emptyText: "(host process data will appear on the next poll)"
-                    }
-
-                    /* ---------- Guest section ---------- */
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 8
-
-                        Text {
-                            text: root.guestId !== ""
-                                ? "Guest \u2014 " + root.guestId + (root.guestName !== "" && root.guestName !== "-" ? " \u00b7 " + root.guestName : "")
-                                : "Guest"
-                            color: "#e6edf3"; font.pixelSize: 13; font.bold: true
+                        RowLayout {
                             Layout.fillWidth: true
+                            Text {
+                                text: "Hypervisor host"
+                                color: Theme.textPrimary
+                                font.pixelSize: Theme.fontMedium
+                                font.weight: Font.DemiBold
+                                Layout.fillWidth: true
+                            }
+                            StatusPill { text: "online"; tone: "success" }
                         }
 
-                        Rectangle {
-                            implicitWidth: 90
-                            implicitHeight: 24
-                            radius: 12
-                            color: root.guestRunning ? "#3fb95022" : "#f8514922"
-                            visible: root.guestId !== ""
-                            Text {
-                                anchors.centerIn: parent
-                                text: root.guestRunning ? "running" : "stopped"
-                                color: root.guestRunning ? "#3fb950" : "#f85149"
-                                font.pixelSize: 12; font.bold: true
+                        Flow {
+                            Layout.fillWidth: true
+                            spacing: Theme.spacingTight
+
+                            Stat { label: "HOSTNAME"; value: root.hostSummary ? (root.hostSummary.hostname || "—") : "—" }
+                            Stat { label: "LOAD";     value: root.loadText(root.hostSummary) }
+                            Stat {
+                                label: "CPUS"
+                                value: root.hostSummary && root.hostSummary.cpus > 0
+                                    ? String(root.hostSummary.cpus) +
+                                      (root.hostSummary.threads > 0 ? " · " + root.hostSummary.threads + " threads" : "")
+                                    : "—"
+                            }
+                            RamStat {
+                                usedBytes: (root.hostSummary && root.hostSummary.ram.used) ? root.hostSummary.ram.used : 0
+                                totalBytes: (root.hostSummary && root.hostSummary.ram.total) ? root.hostSummary.ram.total : 0
+                            }
+                            Stat {
+                                label: "KERNEL"
+                                minWidth: 320
+                                value: root.hostSummary ? (root.hostSummary.kernel || "—") : "—"
                             }
                         }
-                    }
 
-                    Text {
-                        Layout.fillWidth: true
-                        visible: root.guestId === ""
-                        text: "Select a guest from the Guests tab to monitor it here as well."
-                        color: "#8b949e"; font.pixelSize: 12
-                    }
-
-                    Text {
-                        Layout.fillWidth: true
-                        visible: root.guestId !== "" && !root.guestRunning
-                        text: "Guest is not running \u2014 process statistics unavailable."
-                        color: "#f85149"; font.pixelSize: 12
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        visible: root.guestId !== "" && root.guestRunning
-                        spacing: 8
-
-                        Card { label: "Hostname"; value: root.guestSummary ? (root.guestSummary.hostname || "\u2013") : "\u2013" }
-                        Card {
-                            label: "Load"
-                            value: (root.guestSummary && root.guestSummary.load.length > 0)
-                                ? root.guestSummary.load.map(function (v) { return v.toFixed(2) }).join(" / ")
-                                : (root.guestSummary && root.guestSummary.cpuBusyPct !== null)
-                                    ? "busy " + root.guestSummary.cpuBusyPct.toFixed(0) + "%"
-                                    : "\u2013"
+                        ProcTable {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            procModel: hostProcs
+                            emptyText: "Host process data appears on the next poll."
                         }
-                        Card {
-                            label: "CPU(s)"
-                            value: root.guestSummary && root.guestSummary.cpus > 0
-                                ? String(root.guestSummary.cpus) + (root.guestSummary.threads > 0 ? " \u00b7 " + root.guestSummary.threads + " threads" : "")
-                                : "\u2013"
-                        }
-                        Card {
-                            label: "Kernel"
-                            Layout.preferredWidth: 280
-                            value: root.guestSummary ? (root.guestSummary.kernel || "\u2013") : "\u2013"
-                        }
-                        RamCard {
-                            label: "RAM"
-                            usedText: (root.guestSummary && root.guestSummary.ram.used !== null) ? Stats.fmtBytes(root.guestSummary.ram.used) : "\u2013"
-                            totalText: (root.guestSummary && root.guestSummary.ram.total !== null) ? Stats.fmtBytes(root.guestSummary.ram.total) : "\u2013"
-                            usedBytes: (root.guestSummary && root.guestSummary.ram.used) ? root.guestSummary.ram.used : 0
-                            totalBytes: (root.guestSummary && root.guestSummary.ram.total) ? root.guestSummary.ram.total : 0
-                        }
-                    }
-
-                    ProcTable {
-                        id: guestProcTable
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 200
-                        Layout.bottomMargin: 10
-                        procModel: guestProcs
-                        emptyText: "(guest process data will appear on the next poll)"
                     }
                 }
+
+                /* ---- guest ---- */
+                AppCard {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: root.guestRunning ? 400 : 140
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        spacing: Theme.spacingTight
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Text {
+                                text: root.guestId !== ""
+                                    ? "Guest — " + root.guestId +
+                                      (root.guestName !== "" && root.guestName !== "-" ? " · " + root.guestName : "")
+                                    : "Guest"
+                                color: Theme.textPrimary
+                                font.pixelSize: Theme.fontMedium
+                                font.weight: Font.DemiBold
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                            }
+                            StatusPill {
+                                visible: root.guestId !== ""
+                                text: root.guestRunning ? "running" : "stopped"
+                                tone: root.guestRunning ? "success" : "danger"
+                            }
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            visible: root.guestId === ""
+                            text: "No guest selected. Click a row on the Guests page to monitor it alongside the host."
+                            color: Theme.textSecondary
+                            font.pixelSize: Theme.fontBody
+                            wrapMode: Text.Wrap
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            visible: root.guestId !== "" && !root.guestRunning
+                            text: "Guest is not running — HMS cannot SSH into it for statistics."
+                            color: Theme.warning
+                            font.pixelSize: Theme.fontBody
+                            wrapMode: Text.Wrap
+                        }
+
+                        Flow {
+                            Layout.fillWidth: true
+                            visible: root.guestRunning
+                            spacing: Theme.spacingTight
+
+                            Stat { label: "HOSTNAME"; value: root.guestSummary ? (root.guestSummary.hostname || "—") : "—" }
+                            Stat { label: "LOAD";     value: root.loadText(root.guestSummary) }
+                            Stat {
+                                label: "CPUS"
+                                value: root.guestSummary && root.guestSummary.cpus > 0
+                                    ? String(root.guestSummary.cpus) +
+                                      (root.guestSummary.threads > 0 ? " · " + root.guestSummary.threads + " threads" : "")
+                                    : "—"
+                            }
+                            RamStat {
+                                usedBytes: (root.guestSummary && root.guestSummary.ram.used) ? root.guestSummary.ram.used : 0
+                                totalBytes: (root.guestSummary && root.guestSummary.ram.total) ? root.guestSummary.ram.total : 0
+                            }
+                            Stat {
+                                label: "KERNEL"
+                                minWidth: 320
+                                value: root.guestSummary ? (root.guestSummary.kernel || "—") : "—"
+                            }
+                        }
+
+                        ProcTable {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            visible: root.guestRunning
+                            procModel: guestProcs
+                            emptyText: "Guest process data appears on the next poll."
+                        }
+                    }
+                }
+
+                Item { Layout.preferredHeight: Theme.spacing }
             }
         }
-    }
     }
 
     Timer {
         id: pollTimer
         interval: root.pollIntervalMs
         repeat: true
-        running: root.enabled && root.autoRefresh
+        running: root.active && root.autoRefresh
         onTriggered: {
-            /* Skip a poll while the previous stats request is still in flight —
-               each request takes a few seconds (SSH into the guest), so sending
-               every 3 s regardless would backlog HMS. */
+            /* Skip while a request is outstanding: each one SSHes into the
+               guest and can take seconds, so polling regardless would backlog
+               HMS. */
             if (!root.requestInFlight) {
                 root.requestInFlight = true
                 watchdog.start()
@@ -490,25 +532,18 @@ Item {
         }
     }
 
-    /* If no stats response arrives (HMS busy / connection hiccup), release the
-       in-flight flag after 15 s so polling can resume. */
     Timer {
         id: watchdog
         interval: 15000
         repeat: false
         onTriggered: {
             root.requestInFlight = false
-            root.statusText = "No response \u2014 will retry"
+            root.statusText = "No response — will retry"
         }
     }
 
-    onEnabledChanged: {
-        if (enabled) {
-            statusText = "Fetching..."
-            refreshNow()
-        } else {
-            requestInFlight = false
-            watchdog.stop()
-        }
+    onActiveChanged: {
+        if (active) refreshNow()
+        else { requestInFlight = false; watchdog.stop() }
     }
 }

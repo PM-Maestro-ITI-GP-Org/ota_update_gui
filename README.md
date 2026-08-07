@@ -19,30 +19,42 @@ through the jump server (laptop → server → QNX target, and back).
 
 ## Features
 
-- MQTT connection with automatic retry / reconnect
-- **Guests** tab: live list of guests on the host (auto-refresh every
-  10 s), Start (with optional IP), Kill, Info (full details dialog)
-- **OTA Update** tab: pick a package on the laptop, upload it to the
-  server with SCP (progress %), then deploy — HMS pulls it from the
-  server, applies it into `/guests/<guest>/` and restarts the guest
-  (progress stages: download → extract → apply → restart)
-- **Download** helper: pull any file from the server to the laptop
-- **Remote Shell** tab: run commands inside a running guest over SSH
-- **Log** tab: timestamped, color-coded log of everything
+- MQTT connection with automatic retry and backoff reconnect
+- **Guests**: live list of guests on the host, Start (with optional IP),
+  Kill (confirmed), Info, jump to Shell, and Create a new guest
+- **OTA Update**: pick a replacement for any partition file, then a
+  three-step flow shown as a stepper — upload to the server, pull down
+  to the host, apply into `/guests/<guest>/` and restart. Also sends
+  arbitrary files into a running guest at chosen paths.
+- **Shell**: one-shot `exec`, or a persistent interactive session with
+  command history
+- **Monitor**: host and guest statistics, auto-polling
+- **Log**: timestamped, colour-coded, filterable, copyable
+
+## Look and feel
+
+Material Design via `QtQuick.Controls.Material`, light theme by default
+with a dark toggle in the header (the ☾/☀ button). All colour, type and
+spacing come from `Theme.qml`; there are no hex literals in the pages.
+Base font size is 15px.
 
 ## Prerequisites
 
-Same as the motor recorder GUI: Qt 6.10.2 (gcc_64) installed at
-`/home/gemy/Qt/6.10.2/gcc_64` and the Paho MQTT C library
+Qt 6.10.2 (gcc_64) and the Paho MQTT C library
 (`sudo apt install libpaho-mqtt-dev`). Also needs `ssh`/`scp` on the
 PATH and an SSH key at `~/.ssh/id_ed25519` that can log into the server
 (`maxmaster@139.185.38.211`).
 
+Without Paho the app still builds and runs — the UI works, but it cannot
+talk to HMS and the header shows "Demo mode".
+
 ## Build
 
+Point CMake at your Qt with `CMAKE_PREFIX_PATH`. (`Qt6_DIR` used to be
+hardcoded to one developer's home directory; it no longer is.)
+
 ```bash
-cd /media/gemy/Extra/ITI_GP/ota_update_gui
-cmake -B build -DCMAKE_PREFIX_PATH=/home/gemy/Qt/6.10.2/gcc_64 -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DCMAKE_PREFIX_PATH=$HOME/Qt/6.10.2/gcc_64 -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target ota_gui -j$(nproc)
 ```
 
@@ -76,8 +88,18 @@ keeps retrying if the broker is unreachable.
 
 | Topic | Direction | Format | Description |
 |-------|-----------|--------|-------------|
-| `hms/cmd` | GUI → HMS | plain text | `list`, `start <guest> [ip]`, `kill <guest>`, `info <guest>`, `exec <guest> <cmd>`, `ota <guest> <remote_path>`, `ping` |
-| `hms/status` | HMS → GUI | JSON | guest lists, results, exec output, OTA progress/result |
+| `hms/cmd` | GUI → HMS | plain text | see below |
+| `hms/status` | HMS → GUI | JSON | guest lists, results, exec output, shell stream, OTA progress/result |
+
+Commands sent: `list`, `start`, `kill`, `info`, `exec`, `stats`, `files`,
+`fetch`, `apply`, `pushfiles`, `addfile`, `addguest`, `shellopen`,
+`shellwrite`, `shellclose`, `ping`.
+
+Status states handled: `guest_list`, `guest_info`, `result`,
+`exec_result`, `monitor_stats`, `guest_files`, `ota_progress`,
+`ota_result`, `shell_opened`, `shell_out`, `shell_closed`,
+`addfile_result`, `addguest_result`, `pong`. Anything else is logged
+rather than silently dropped.
 
 Credentials (in `mqttclient.cpp`): user `mqttuser`, password `123456`.
 
@@ -90,12 +112,19 @@ Credentials (in `mqttclient.cpp`): user `mqttuser`, password `123456`.
 
 ## Project structure
 
-- `main.cpp` — entry point, registers the `MqttClient` QML type
-- `main.qml` — UI (guests, OTA, shell, log; in-window file picker)
-- `LogPanel.qml` — reusable log view
+- `main.cpp` — entry point; selects the Material style, registers
+  `MqttClient` and the `Theme` singleton, and reports QML load failures
+  instead of exiting silently with no window
+- `main.qml` — window chrome, navigation, shared models, MQTT wiring,
+  and the dialogs (file picker, guest browser, guest info)
+- `GuestsPage.qml` / `OtaPage.qml` / `ShellPage.qml` /
+  `GuestMonitor.qml` / `LogPanel.qml` — the five screens
+- `Theme.qml` — the palette, type scale and spacing (singleton)
+- `AppCard.qml` / `SectionTitle.qml` / `StatusPill.qml` /
+  `FilledButton.qml` — shared building blocks
 - `mqttclient.h` / `mqttclient.cpp` — Paho MQTT wrapper, command
   publishing, status parsing, SCP upload/download with progress
-- `CMakeLists.txt` — build configuration (Qt 6.10.2 + Paho)
+- `CMakeLists.txt` — build configuration (Qt 6 + Paho)
 
 ## Troubleshooting
 

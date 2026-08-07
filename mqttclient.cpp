@@ -21,34 +21,45 @@
 
 #ifdef HAVE_MQTT
 
-struct MqttContext {
-    MqttClient *self;
-    QString clientId;
-    MQTTClient_connectOptions opts;
-};
-
+/*
+ * The callback context is the MqttClient itself.
+ *
+ * It used to be a heap-allocated MqttContext that was only deleted on the
+ * failure paths -- so every successful connect leaked one, and since a dropped
+ * connection reconnects by calling connectToBroker() again, a long session
+ * leaked one per reconnect along with the previous MQTTClient handle, which
+ * MQTTClient_create() overwrote without destroying.
+ */
 static void on_connection_lost(void *context, char *cause)
 {
-    auto *ctx = static_cast<MqttContext *>(context);
+    auto *self = static_cast<MqttClient *>(context);
     fprintf(stderr, "[MQTT] Connection lost: %s\n", cause ? cause : "unknown");
-    QMetaObject::invokeMethod(ctx->self, [self = ctx->self]() {
-        if (self->isConnected())
-            self->scheduleReconnect();
+
+    /*
+     * This is where reconnection was dying. The old body called
+     * scheduleReconnect() only `if (self->isConnected())`, and never cleared
+     * the flag -- while scheduleReconnect() itself begins `if (m_connected)
+     * return;`. So the one path into it was guarded on the very condition that
+     * made it a no-op, and the GUI sat showing "Connected" forever after the
+     * broker went away, with every command silently doing nothing.
+     */
+    QMetaObject::invokeMethod(self, [self]() {
+        self->onConnectionLost();
     }, Qt::QueuedConnection);
 }
 
 static int on_message(void *context, char *topicName, int topicLen,
                       MQTTClient_message *message)
 {
-    auto *ctx = static_cast<MqttContext *>(context);
-    int tlen = (topicLen > 0) ? topicLen : (topicName ? strlen(topicName) : 0);
+    auto *self = static_cast<MqttClient *>(context);
+    int tlen = (topicLen > 0) ? topicLen : (topicName ? (int)strlen(topicName) : 0);
     QString topic = QString::fromUtf8(topicName, tlen);
     QString payload = QString::fromUtf8(
         static_cast<char *>(message->payload), message->payloadlen);
 
     fprintf(stderr, "[MQTT] << %s : %s\n", qPrintable(topic), payload.left(160).toUtf8().constData());
 
-    QMetaObject::invokeMethod(ctx->self, [self = ctx->self, topic, payload]() {
+    QMetaObject::invokeMethod(self, [self, topic, payload]() {
         if (topic == STATUS_TOPIC)
             self->handleStatusMessage(payload);
     }, Qt::QueuedConnection);
@@ -83,12 +94,34 @@ MqttClient::MqttClient(QObject *parent)
 
 MqttClient::~MqttClient()
 {
+    teardownClient();
+}
+
+/* Drop the Paho handle if there is one. Safe to call when there is not. */
+void MqttClient::teardownClient()
+{
 #ifdef HAVE_MQTT
     if (m_client) {
-        MQTTClient_disconnect(m_client, 1000);
+        if (MQTTClient_isConnected(m_client))
+            MQTTClient_disconnect(m_client, 1000);
+        MQTTClient_setCallbacks(m_client, nullptr, nullptr, nullptr, nullptr);
         MQTTClient_destroy(&m_client);
+        m_client = nullptr;
     }
 #endif
+}
+
+void MqttClient::onConnectionLost()
+{
+    /* Clear the flag first: scheduleReconnect() refuses to do anything while
+       it is still set, which is what stopped the GUI ever coming back. */
+    setConnected(false);
+    setStatusText("Connection lost — reconnecting...");
+    m_yieldTimer->stop();
+    m_cmdTimer->stop();
+    m_pendingCmd.clear();
+    emitLog("Connection to broker lost — will reconnect.", "warning");
+    scheduleReconnect();
 }
 
 bool MqttClient::isConnected() const { return m_connected; }
@@ -98,6 +131,10 @@ QString MqttClient::statusText() const { return m_statusText; }
 QString MqttClient::broker() const { return MQTT_BROKER; }
 
 QString MqttClient::serverUserHost() const { return SERVER_USER_HOST; }
+
+QString MqttClient::homePath() const { return QDir::homePath(); }
+
+QString MqttClient::serverUploadDir() const { return SERVER_UPLOAD_DIR; }
 
 void MqttClient::setConnected(bool c)
 {
@@ -128,28 +165,36 @@ void MqttClient::connectToBroker()
     fprintf(stderr, "[GUI] Connecting to MQTT broker %s...\n", MQTT_BROKER);
     emitLog("Connecting to MQTT broker " MQTT_BROKER " ...", "info");
 
-    auto *ctx = new MqttContext;
-    ctx->self = this;
-    ctx->clientId = "ota_gui_" + QString::number(QDateTime::currentMSecsSinceEpoch());
+    /* Reconnecting calls straight back into here, so an old handle from the
+       previous attempt has to go before MQTTClient_create() overwrites the
+       member and loses it. */
+    teardownClient();
 
-    int rc = MQTTClient_create(&m_client, MQTT_BROKER, ctx->clientId.toStdString().c_str(),
+    const QString clientId =
+        "ota_gui_" + QString::number(QDateTime::currentMSecsSinceEpoch());
+    const QByteArray clientIdUtf8 = clientId.toUtf8();
+
+    int rc = MQTTClient_create(&m_client, MQTT_BROKER, clientIdUtf8.constData(),
                               MQTTCLIENT_PERSISTENCE_NONE, nullptr);
     if (rc != MQTTCLIENT_SUCCESS) {
         fprintf(stderr, "[GUI] MQTTClient_create failed: %d\n", rc);
         emitLog("Failed to create MQTT client.", "error");
         setStatusText("Create failed");
-        delete ctx;
+        m_client = nullptr;
+        scheduleReconnect();
         return;
     }
 
-    ctx->opts = MQTTClient_connectOptions_initializer;
-    ctx->opts.connectTimeout = 5;
-    ctx->opts.username = MQTT_USER;
-    ctx->opts.password = MQTT_PASS;
+    MQTTClient_connectOptions opts = MQTTClient_connectOptions_initializer;
+    opts.connectTimeout = 5;
+    opts.keepAliveInterval = 30;
+    opts.cleansession = 1;
+    opts.username = MQTT_USER;
+    opts.password = MQTT_PASS;
 
-    MQTTClient_setCallbacks(m_client, ctx, on_connection_lost, on_message, nullptr);
+    MQTTClient_setCallbacks(m_client, this, on_connection_lost, on_message, nullptr);
 
-    rc = MQTTClient_connect(m_client, &ctx->opts);
+    rc = MQTTClient_connect(m_client, &opts);
     if (rc == MQTTCLIENT_SUCCESS) {
         MQTTClient_subscribe(m_client, STATUS_TOPIC, 0);
         m_reconnectTimer->stop();
@@ -164,10 +209,8 @@ void MqttClient::connectToBroker()
         setConnected(false);
         setStatusText("Connection failed");
         fprintf(stderr, "[GUI] MQTT connection failed (error %d)\n", rc);
-        emitLog(QString("MQTT connection failed (error %1).").arg(rc), "error");
-        MQTTClient_destroy(&m_client);
-        m_client = nullptr;
-        delete ctx;
+        emitLog(QString("MQTT connection failed (error %1) — retrying.").arg(rc), "error");
+        teardownClient();
         scheduleReconnect();
     }
 #else
@@ -181,13 +224,7 @@ void MqttClient::disconnectFromBroker()
     m_yieldTimer->stop();
     m_reconnectTimer->stop();
     m_reconnectAttempts = 0;
-#ifdef HAVE_MQTT
-    if (m_client) {
-        MQTTClient_disconnect(m_client, 1000);
-        MQTTClient_destroy(&m_client);
-        m_client = nullptr;
-    }
-#endif
+    teardownClient();
     m_cmdTimer->stop();
     m_pendingCmd.clear();
     setConnected(false);
@@ -199,11 +236,16 @@ void MqttClient::scheduleReconnect()
 {
     if (m_connected)
         return;
-    m_reconnectAttempts++;
-    fprintf(stderr, "[GUI] Reconnect attempt %d scheduled\n", m_reconnectAttempts);
     if (m_reconnectTimer->isActive())
         return;
-    m_reconnectTimer->start();
+
+    m_reconnectAttempts++;
+    /* Back off 2s, 4s, 8s ... capped at 30s, so a broker that is down for a
+       while is not hammered with a connect attempt every 5 seconds for hours. */
+    int delayMs = qMin(2000 * (1 << qMin(m_reconnectAttempts - 1, 4)), 30000);
+    fprintf(stderr, "[GUI] Reconnect attempt %d in %d ms\n", m_reconnectAttempts, delayMs);
+    setStatusText(QString("Reconnecting in %1s...").arg(delayMs / 1000));
+    m_reconnectTimer->start(delayMs);
 }
 
 void MqttClient::attemptReconnect()
@@ -297,6 +339,62 @@ void MqttClient::guestStats(const QString &id)
     emitLog("Requesting system stats" + (id.isEmpty() ? QString() : " for '" + id + "'") + "...", "info");
 }
 
+/* ---- Interactive shell (HMS shell.c) ---------------------------------- */
+
+void MqttClient::shellOpen(const QString &guestId)
+{
+    if (guestId.isEmpty()) { emitLog("Select a guest first.", "error"); return; }
+    publishCommand("shellopen " + guestId);
+    emitLog("Opening interactive shell on '" + guestId + "'...", "info");
+}
+
+void MqttClient::shellWrite(const QString &guestId, const QString &data)
+{
+    if (guestId.isEmpty()) return;
+    /* No timeout tracking: the reply is a stream of shell_out chunks, not a
+       single response, and re-arming the command timer on every keystroke
+       would fire spuriously the moment the user paused. */
+    publishNoWait("shellwrite " + guestId + " " + data);
+}
+
+void MqttClient::shellClose(const QString &guestId)
+{
+    if (guestId.isEmpty()) return;
+    publishCommand("shellclose " + guestId);
+    emitLog("Closing shell on '" + guestId + "'.", "info");
+}
+
+/* ---- addfile / addguest (HMS ota.c) ----------------------------------- */
+
+void MqttClient::addFileToGuest(const QString &guestId, const QString &serverPath)
+{
+    if (guestId.isEmpty() || serverPath.isEmpty()) {
+        emitLog("Add file needs a guest and a staged server path.", "error");
+        return;
+    }
+    publishCommand("addfile " + guestId + " " + serverPath);
+    emitLog("Adding " + serverPath + " to guest '" + guestId + "'...", "info");
+}
+
+void MqttClient::addGuest(const QString &guestId, const QString &ifsServerPath,
+                          const QString &confServerPath, const QString &ip)
+{
+    if (guestId.isEmpty() || ifsServerPath.isEmpty() || confServerPath.isEmpty()) {
+        emitLog("New guest needs an id, a boot image and a qvmconf.", "error");
+        return;
+    }
+    QString cmd = "addguest " + guestId + " " + ifsServerPath + " " + confServerPath;
+    if (!ip.isEmpty()) cmd += " " + ip;
+    publishCommand(cmd);
+    emitLog("Creating guest '" + guestId + "' on the host...", "info");
+}
+
+void MqttClient::ping()
+{
+    publishCommand("ping");
+    emitLog("Ping...", "info");
+}
+
 void MqttClient::guestFiles(const QString &id)
 {
     if (id.isEmpty()) {
@@ -367,8 +465,38 @@ void MqttClient::handleStatusMessage(const QString &payload)
     } else if (state == "guest_files") {
         clearIfPending("files");
         emit guestFilesReceived(payload);
+    } else if (state == "shell_opened") {
+        clearIfPending("shellopen");
+        emit shellOpened(obj.value("guest").toString(), obj.value("msg").toString());
+    } else if (state == "shell_out") {
+        emit shellOutput(obj.value("guest").toString(), obj.value("data").toString());
+    } else if (state == "shell_closed") {
+        clearIfPending("shellclose");
+        emit shellClosed(obj.value("guest").toString(), obj.value("msg").toString());
+    } else if (state == "addfile_result") {
+        clearIfPending("addfile");
+        emit addFileResult(obj.value("guest").toString(),
+                           obj.value("success").toBool(),
+                           obj.value("msg").toString());
+        emitLog("Add file: " + obj.value("msg").toString(),
+                obj.value("success").toBool() ? "success" : "error");
+    } else if (state == "addguest_result") {
+        clearIfPending("addguest");
+        emit addGuestResult(obj.value("guest").toString(),
+                            obj.value("success").toBool(),
+                            obj.value("msg").toString());
+        emitLog("Add guest: " + obj.value("msg").toString(),
+                obj.value("success").toBool() ? "success" : "error");
     } else if (state == "pong") {
+        clearIfPending("ping");
         emit pongReceived();
+        emitLog("Pong — HMS is alive.", "success");
+    } else if (!state.isEmpty()) {
+        /* Unknown states were dropped in silence, which is how a protocol
+           drifts apart without anyone noticing. */
+        fprintf(stderr, "[GUI] unhandled status state '%s'\n", qPrintable(state));
+    } else {
+        emitLog("Ignored a malformed status message from HMS.", "warning");
     }
 }
 
@@ -396,16 +524,21 @@ void MqttClient::uploadAndDeployOta(const QString &guestId, const QString &local
     emitLog("Uploading " + localFilePath + " to server " SERVER_USER_HOST " ...", "info");
 
     struct UploadState {
-        QProcess *proc;
-        QProcess *statProc;
-        qint64 localSize;
+        QProcess *proc = nullptr;
+        QProcess *statProc = nullptr;
+        qint64 localSize = 0;
         int lastPct = -1;
         QString guestId;
         QString remotePath;
         QString localFilePath;
     };
 
-    auto *up = new UploadState;
+    /* shared_ptr, not new/delete. The state was deleted at the end of the
+       proc-finished handler while the statProc handler still captured it by
+       raw pointer, so a stat that landed after the upload finished read freed
+       memory. startScpUpload() below already did it this way; this function
+       had not been brought along. */
+    auto up = std::make_shared<UploadState>();
     up->proc = new QProcess(this);
     up->statProc = new QProcess(this);
     up->localSize = fi.size();
@@ -415,7 +548,7 @@ void MqttClient::uploadAndDeployOta(const QString &guestId, const QString &local
 
     QStringList args = {
         "-C",
-        "-o", "StrictHostKeyChecking=no",
+        "-o", "StrictHostKeyChecking=accept-new",
         "-o", "ConnectTimeout=15",
         "-o", "ServerAliveInterval=10",
         "-i", SERVER_KEY_PATH,
@@ -447,7 +580,7 @@ void MqttClient::uploadAndDeployOta(const QString &guestId, const QString &local
         if (up->statProc->state() == QProcess::Running) return;
         QStringList sizeArgs = {
             "-i", SERVER_KEY_PATH,
-            "-o", "StrictHostKeyChecking=no",
+            "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=5",
             SERVER_USER_HOST,
             "stat -c %s " + up->remotePath
@@ -467,6 +600,7 @@ void MqttClient::uploadAndDeployOta(const QString &guestId, const QString &local
         } else {
             QString err = QString::fromUtf8(up->proc->readAllStandardError()).trimmed();
             emitLog("SCP upload failed (exit=" + QString::number(exitCode) + ") " + err, "error");
+            emit uploadFailed(QFileInfo(up->localFilePath).fileName(), err);
         }
         if (up->statProc->state() != QProcess::NotRunning) {
             up->statProc->kill();
@@ -474,7 +608,17 @@ void MqttClient::uploadAndDeployOta(const QString &guestId, const QString &local
         }
         up->statProc->deleteLater();
         up->proc->deleteLater();
-        delete up;
+    });
+
+    /* If scp is missing from PATH, finished() never fires -- the timer would
+       poll forever and the caller would never learn the upload failed. */
+    connect(up->proc, &QProcess::errorOccurred, this,
+            [this, up, progressTimer](QProcess::ProcessError e) {
+        if (e != QProcess::FailedToStart) return;
+        progressTimer->stop();
+        progressTimer->deleteLater();
+        emitLog("Could not run 'scp' — is OpenSSH installed and on PATH?", "error");
+        emit uploadFailed(QFileInfo(up->localFilePath).fileName(), "scp not found");
     });
 
     up->proc->start("scp", args);
@@ -541,7 +685,7 @@ void MqttClient::startScpUpload(const QString &localFilePath, const QString &rem
     up->localFilePath = localFilePath;
 
     QStringList args = {
-        "-C", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
+        "-C", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15",
         "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=60",
         "-i", SERVER_KEY_PATH, localFilePath,
         QString(SERVER_USER_HOST) + ":" + remotePath
@@ -578,7 +722,7 @@ void MqttClient::startScpUpload(const QString &localFilePath, const QString &rem
             up->proc->waitForFinished(2000);
         }
         QStringList rmArgs = {
-            "-i", SERVER_KEY_PATH, "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+            "-i", SERVER_KEY_PATH, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
             SERVER_USER_HOST, "rm -f " + up->remotePath
         };
         QProcess rmProc;
@@ -593,7 +737,7 @@ void MqttClient::startScpUpload(const QString &localFilePath, const QString &rem
         if (up->proc->state() != QProcess::Running) return;
         if (up->statProc->state() == QProcess::Running) return;
         QStringList sizeArgs = {
-            "-i", SERVER_KEY_PATH, "-o", "StrictHostKeyChecking=no",
+            "-i", SERVER_KEY_PATH, "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=5", SERVER_USER_HOST,
             "stat -c %s " + up->remotePath
         };
@@ -652,6 +796,19 @@ void MqttClient::startScpUpload(const QString &localFilePath, const QString &rem
         }
         up->statProc->deleteLater();
         up->proc->deleteLater();
+    });
+
+    /* Same missing-scp case as in uploadAndDeployOta(): without this the
+       watchdog would keep "retrying" a process that never starts. */
+    connect(up->proc, &QProcess::errorOccurred, this,
+            [this, up, progressTimer](QProcess::ProcessError e) {
+        if (e != QProcess::FailedToStart) return;
+        progressTimer->stop();
+        progressTimer->deleteLater();
+        up->watchdog->stop();
+        up->finalKill = true;
+        emitLog("Could not run 'scp' — is OpenSSH installed and on PATH?", "error");
+        emit uploadFailed(QFileInfo(up->localFilePath).fileName(), "scp not found");
     });
 
     up->watchdog->setSingleShot(true);
@@ -801,57 +958,55 @@ QString MqttClient::buildPushTar(const QVariantList &entries, const QString &out
     return outPath;
 }
 
+/*
+ * Rewritten to hold its state in a shared_ptr like the upload paths do.
+ *
+ * The old version owned ScpState and a QElapsedTimer with raw new/delete and
+ * freed them only inside the scp-finished handler -- so any path that did not
+ * reach it leaked both, and the "ssh stat" step failing to start (no ssh on
+ * PATH) meant its finished() never fired, the scp was never launched, and the
+ * caller was left waiting on a download that had not been started.
+ */
 void MqttClient::downloadFromServer(const QString &remotePath, const QString &localPath)
 {
     emitLog("Downloading from server: " + remotePath, "info");
 
-    auto *st = new QProcess(this);
-    st->setParent(this);
-
-    auto *elapsed = new QElapsedTimer();
-    elapsed->start();
-
-    QStringList sizeArgs = {
-        "-i", SERVER_KEY_PATH,
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "ConnectTimeout=10",
-        SERVER_USER_HOST, "stat -c %s " + remotePath
-    };
-
     struct ScpState {
-        QProcess *proc;
-        QTimer *progressTimer;
+        QProcess *sizeProc = nullptr;
+        QProcess *proc = nullptr;
+        QTimer *progressTimer = nullptr;
         int lastPct = -1;
         qint64 remoteSize = 0;
         QString localPath;
         QString remotePath;
-        QElapsedTimer *elapsed;
+        QElapsedTimer elapsed;
         QString stderrBuf;
+        bool started = false;
     };
 
-    auto *dl = new ScpState;
+    auto dl = std::make_shared<ScpState>();
+    dl->sizeProc = new QProcess(this);
     dl->proc = new QProcess(this);
     dl->progressTimer = new QTimer(this);
     dl->localPath = localPath;
     dl->remotePath = remotePath;
-    dl->elapsed = elapsed;
+    dl->elapsed.start();
 
-    connect(st, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this, st, dl](int code, QProcess::ExitStatus) {
-        st->deleteLater();
-        if (code == 0) {
-            dl->remoteSize = QString::fromUtf8(
-                st->readAllStandardOutput()).trimmed().toLongLong();
-        } else {
-            fprintf(stderr, "[GUI] ssh stat failed (exit=%d)\n", code);
-        }
+    /* Launch the transfer once the size probe has answered, however it
+       answered -- an unknown size only costs the progress %, it must not stop
+       the download. Guarded so it runs exactly once. */
+    auto startDownload = [this, dl]() {
+        if (dl->started) return;
+        dl->started = true;
+        dl->sizeProc->deleteLater();
 
         QStringList scpArgs = {
             "-C",
             "-i", SERVER_KEY_PATH,
-            "-o", "StrictHostKeyChecking=no",
+            "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=30",
-            dl->remotePath, dl->localPath
+            QString(SERVER_USER_HOST) + ":" + dl->remotePath,
+            dl->localPath
         };
 
         connect(dl->proc, &QProcess::readyReadStandardError, this,
@@ -859,18 +1014,12 @@ void MqttClient::downloadFromServer(const QString &remotePath, const QString &lo
 
         if (dl->remoteSize > 0) {
             connect(dl->progressTimer, &QTimer::timeout, this, [this, dl]() {
-                QFile f(dl->localPath);
-                qint64 localSize = 0;
-                if (f.open(QIODevice::ReadOnly)) {
-                    localSize = f.size();
-                    f.close();
-                }
-                int pct = localSize * 100 / qMax(dl->remoteSize, (qint64)1);
+                qint64 localSize = QFileInfo(dl->localPath).size();
+                int pct = (int)(localSize * 100 / qMax(dl->remoteSize, (qint64)1));
                 if (pct > 100) pct = 100;
                 if (pct != dl->lastPct) {
                     dl->lastPct = pct;
                     emit downloadProgress(pct);
-                    emitLog("Download progress: " + QString::number(pct) + "%", "info");
                 }
                 if (pct >= 100)
                     dl->progressTimer->stop();
@@ -883,23 +1032,50 @@ void MqttClient::downloadFromServer(const QString &remotePath, const QString &lo
             dl->progressTimer->stop();
             dl->progressTimer->deleteLater();
             dl->proc->deleteLater();
-            qint64 totalTime = dl->elapsed->elapsed();
-            delete dl->elapsed;
 
             if (exitCode == 0) {
                 emit downloadProgress(100);
-                emitLog("Downloaded to " + dl->localPath +
-                        " (" + QString::number(QFileInfo(dl->localPath).size() / 1024) + " KB in " +
-                        QString::number(totalTime / 1000) + "s)", "success");
+                emitLog("Downloaded to " + dl->localPath + " (" +
+                        QString::number(QFileInfo(dl->localPath).size() / 1024) +
+                        " KB in " + QString::number(dl->elapsed.elapsed() / 1000) + "s)",
+                        "success");
             } else {
-                fprintf(stderr, "%s\n", qPrintable(dl->stderrBuf));
-                emitLog("SCP download failed (exit=" + QString::number(exitCode) + ")", "error");
+                emitLog("SCP download failed (exit=" + QString::number(exitCode) + ") " +
+                        dl->stderrBuf.trimmed(), "error");
             }
-            delete dl;
+        });
+
+        connect(dl->proc, &QProcess::errorOccurred, this,
+                [this, dl](QProcess::ProcessError e) {
+            if (e != QProcess::FailedToStart) return;
+            dl->progressTimer->stop();
+            emitLog("Could not run 'scp' — is OpenSSH installed and on PATH?", "error");
         });
 
         dl->proc->start("scp", scpArgs);
+    };
+
+    connect(dl->sizeProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, [dl, startDownload](int code, QProcess::ExitStatus) {
+        if (code == 0)
+            dl->remoteSize = QString::fromUtf8(
+                dl->sizeProc->readAllStandardOutput()).trimmed().toLongLong();
+        else
+            fprintf(stderr, "[GUI] ssh stat failed (exit=%d) — no progress %%\n", code);
+        startDownload();
     });
 
-    st->start("ssh", sizeArgs);
+    connect(dl->sizeProc, &QProcess::errorOccurred, this,
+            [startDownload](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart)
+            startDownload();      /* no size, but still try the transfer */
+    });
+
+    QStringList sizeArgs = {
+        "-i", SERVER_KEY_PATH,
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=10",
+        SERVER_USER_HOST, "stat -c %s " + remotePath
+    };
+    dl->sizeProc->start("ssh", sizeArgs);
 }
