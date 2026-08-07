@@ -154,8 +154,12 @@ Item {
                             }
                             StatusPill {
                                 Layout.preferredWidth: 100
-                                text: model.state
-                                tone: model.running ? "success"
+                                /* A guest whose qvm is up but which is not
+                                   answering SSH yet is booting, not broken. */
+                                text: (model.running && !model.reachable)
+                                    ? "starting" : model.state
+                                tone: (model.running && !model.reachable) ? "warning"
+                                    : model.running ? "success"
                                     : model.state === "crashed" ? "danger" : "neutral"
                             }
                             Text {
@@ -224,8 +228,10 @@ Item {
                                     flat: true
                                     implicitHeight: 38
                                     font.pixelSize: Theme.fontSmall
-                                    enabled: model.running && mqtt.connected
+                                    enabled: model.running && model.reachable && mqtt.connected
                                     Material.foreground: Theme.primary
+                                    ToolTip.visible: hovered && model.running && !model.reachable
+                                    ToolTip.text: "Guest is still booting — sshd is not listening yet."
                                     onClicked: app.openShellFor(model.id)
                                 }
                             }

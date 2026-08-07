@@ -314,7 +314,11 @@ ApplicationWindow {
                     state: g.state,
                     pid: g.pid,
                     ip: g.ip,
-                    running: g.state === "running"
+                    running: g.state === "running",
+                    /* Running but not yet answering SSH — the guest is booting.
+                       Older HMS builds omit the field; treat that as reachable
+                       so this does not disable the shell against them. */
+                    reachable: g.reachable !== false
                 });
             }
             /* Keep the selection on the same guest across a refresh. It used to
