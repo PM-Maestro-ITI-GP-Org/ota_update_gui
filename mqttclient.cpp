@@ -80,7 +80,17 @@ MqttClient::MqttClient(QObject *parent)
 {
     m_cmdTimer->setSingleShot(true);
     connect(m_cmdTimer, &QTimer::timeout, this, &MqttClient::onCmdTimeout);
-    m_yieldTimer->setInterval(50);
+    /*
+     * 500ms, not 50.
+     *
+     * Paho only requires MQTTClient_yield() when the client is *not* using
+     * callbacks; with MQTTClient_setCallbacks() the library runs its own
+     * receive thread and delivery does not depend on this at all. Twenty
+     * wake-ups a second on the GUI thread bought nothing. Kept at a slow tick
+     * rather than deleted outright so behaviour does not hinge on that
+     * reading being right.
+     */
+    m_yieldTimer->setInterval(500);
     connect(m_yieldTimer, &QTimer::timeout, this, []() {
 #ifdef HAVE_MQTT
         MQTTClient_yield();
@@ -721,14 +731,35 @@ void MqttClient::startScpUpload(const QString &localFilePath, const QString &rem
             up->proc->kill();
             up->proc->waitForFinished(2000);
         }
+
+        /*
+         * Clear the partial file on the server, then restart -- without
+         * blocking the GUI thread for it.
+         *
+         * This used to be a stack QProcess with waitForFinished(10000), so a
+         * stalled upload froze the entire interface for up to ten seconds at
+         * exactly the moment the user was watching a progress bar. The retry
+         * now hangs off the process's own finished signal.
+         */
         QStringList rmArgs = {
-            "-i", SERVER_KEY_PATH, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
+            "-i", SERVER_KEY_PATH, "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10",
             SERVER_USER_HOST, "rm -f " + up->remotePath
         };
-        QProcess rmProc;
-        rmProc.start("ssh", rmArgs);
-        rmProc.waitForFinished(10000);
-        startScp();
+        auto *rmProc = new QProcess(this);
+        /* finished() and errorOccurred() can both arrive; only one restart. */
+        auto done = std::make_shared<bool>(false);
+        auto restart = [rmProc, startScp, done]() {
+            if (*done) return;
+            *done = true;
+            rmProc->deleteLater();
+            startScp();
+        };
+        connect(rmProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                this, [restart](int, QProcess::ExitStatus) { restart(); });
+        connect(rmProc, &QProcess::errorOccurred, this,
+                [restart](QProcess::ProcessError) { restart(); });
+        rmProc->start("ssh", rmArgs);
     });
 
     /* Poll the remote file size every 3s for a real progress % */

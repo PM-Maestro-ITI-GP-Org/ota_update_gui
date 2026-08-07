@@ -23,12 +23,21 @@ Item {
 
     property bool active: false
     property bool autoRefresh: true
-    property int  pollIntervalMs: 3000
+    /* 5s, not 3s. Each poll parses a few hundred lines of `top`/`pidin` output
+       in JS on the GUI thread and then refills two list models, so the interval
+       is a direct tax on how responsive the whole app feels. */
+    property int  pollIntervalMs: 5000
+
+    /* Only the busiest processes are worth showing, and the cost of the refill
+       is proportional to how many rows there are. A QNX host reports hundreds;
+       the view is sorted by CPU descending, so the tail is all idle. */
+    property int  maxRows: 60
 
     property string guestId: ""
     property string guestName: ""
     property string guestIp: ""
     property bool   guestRunning: false
+    property string guestError: ""
     property string lastUpdated: ""
     property string statusText: ""
     property bool   requestInFlight: false
@@ -43,17 +52,28 @@ Item {
     property var hostSummary: null
     property var guestSummary: null
 
+    /*
+     * Update in place rather than clear-and-refill.
+     *
+     * model.clear() followed by append() per row makes the ListView discard and
+     * rebuild every delegate, twice, every poll -- which is what the periodic
+     * hitch was. Setting existing rows leaves the delegates alone.
+     */
     function fillModel(model, view) {
-        model.clear()
-        for (var i = 0; i < view.length; i++) {
+        var n = Math.min(view.length, maxRows)
+        for (var i = 0; i < n; i++) {
             var p = view[i]
-            model.append({
+            var row = {
                 pid: p.pid,
                 name: p.name,
                 cpu: (p.cpu === null) ? -1 : p.cpu,
                 mem: (p.mem === null) ? -1 : p.mem
-            })
+            }
+            if (i < model.count) model.set(i, row)
+            else                 model.append(row)
         }
+        while (model.count > n)
+            model.remove(model.count - 1)
     }
 
     function setGuest(id, name, ip, running) {
@@ -97,6 +117,10 @@ Item {
             fillModel(hostProcs, Stats.buildView(h, prevH, pollIntervalMs))
 
             guestRunning = (obj.guest_running === true)
+            /* HMS now says why the guest half is missing instead of just
+               omitting it, which used to be indistinguishable from the guest
+               being stopped. */
+            guestError = obj.guest_error || ""
             if (guestRunning && obj.guest && obj.guest !== "") {
                 var g = Stats.parseSnapshot(obj.guest)
                 guestSummary = g
@@ -466,13 +490,29 @@ Item {
                             wrapMode: Text.Wrap
                         }
 
-                        Text {
+                        ColumnLayout {
                             Layout.fillWidth: true
                             visible: root.guestId !== "" && !root.guestRunning
-                            text: "Guest is not running — HMS cannot SSH into it for statistics."
-                            color: Theme.warning
-                            font.pixelSize: Theme.fontBody
-                            wrapMode: Text.Wrap
+                            spacing: 4
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: root.guestError !== ""
+                                    ? "No statistics for this guest — HMS could not reach it over SSH."
+                                    : "Guest is not running — nothing to report."
+                                color: Theme.warning
+                                font.pixelSize: Theme.fontBody
+                                wrapMode: Text.Wrap
+                            }
+                            Text {
+                                Layout.fillWidth: true
+                                visible: root.guestError !== ""
+                                text: root.guestError
+                                color: Theme.textSecondary
+                                font.family: Theme.monoFamily
+                                font.pixelSize: Theme.fontSmall
+                                wrapMode: Text.WrapAnywhere
+                            }
                         }
 
                         Flow {

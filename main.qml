@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Window
 import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
@@ -727,7 +728,12 @@ ApplicationWindow {
 
             GuestMonitor {
                 id: monitorPage
+                /* Also gated on the window being on screen: polling costs a
+                   `top` plus an SSH on the host and a few hundred lines of
+                   parsing here, and none of that is worth doing for a window
+                   the user has minimised. */
                 active: app.currentPage === 3 && mqtt.connected
+                        && app.visibility !== Window.Minimized
                 onRequestStats: (id) => mqtt.guestStats(id)
             }
 
