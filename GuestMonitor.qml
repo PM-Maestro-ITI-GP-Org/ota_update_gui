@@ -425,11 +425,38 @@ Item {
                     }
                 }
 
+                /*
+                 * Labels carry live state ("(stopped)"), so they have to follow
+                 * the model's CONTENTS, not just its length.
+                 *
+                 * main.qml updates the guest rows in place, so starting a guest
+                 * changes its `running` field while the row count stays the
+                 * same. Watching only onCountChanged left this frozen at
+                 * whatever the guests happened to be when the page first
+                 * loaded -- the picker went on saying "(stopped)" for a guest
+                 * the Guests tab was showing as running.
+                 *
+                 * Labels are patched rather than rebuilt: rebuild() clears the
+                 * model, which would collapse the dropdown under the user if it
+                 * happened to be open when a poll landed.
+                 */
+                function syncLabels() {
+                    if (!root.guests) return;
+                    /* row 0 is "Host only", so guest i lives at row i + 1 */
+                    for (var i = 0; i < root.guests.count && i + 1 < pickerModel.count; ++i) {
+                        var g = root.guests.get(i);
+                        var want = g.id + (g.running ? "" : "  (stopped)");
+                        if (pickerModel.get(i + 1).label !== want)
+                            pickerModel.setProperty(i + 1, "label", want);
+                    }
+                }
+
                 Component.onCompleted: rebuild()
 
                 Connections {
                     target: root.guests
                     function onCountChanged() { guestPicker.rebuild() }
+                    function onDataChanged()  { guestPicker.syncLabels() }
                 }
             }
 
