@@ -23,6 +23,11 @@ Item {
 
     property bool active: false
     property bool autoRefresh: true
+
+    /* Set by main.qml; drives the guest picker in the header. Named `guests`,
+       not `guestsModel`: a property of that name would shadow main.qml.s
+       ListModel id and `guestsModel: guestsModel` would bind to itself. */
+    property var guests: null
     /* 5s, not 3s. Each poll parses a few hundred lines of `top`/`pidin` output
        in JS on the GUI thread and then refills two list models, so the interval
        is a direct tax on how responsive the whole app feels. */
@@ -358,7 +363,7 @@ Item {
                 subtitle: root.guestId !== ""
                     ? "Hypervisor host and guest " + root.guestId +
                       (root.guestIp !== "" && root.guestIp !== "-" ? " (" + root.guestIp + ")" : "")
-                    : "Hypervisor host only — pick a guest from the Guests page to add it."
+                    : "Hypervisor host only — choose a guest to monitor it alongside."
             }
 
             Text {
@@ -366,6 +371,66 @@ Item {
                 color: Theme.textSecondary
                 font.pixelSize: Theme.fontSmall
                 Layout.alignment: Qt.AlignVCenter
+            }
+
+            /*
+             * Guest picker.
+             *
+             * The page told you to "click a row on the Guests page", which is
+             * one way in and was the only one -- landing here from the
+             * navigation rail left you reading an instruction with nothing on
+             * screen to act on. Clicking a guest row still works and still
+             * lands here; this just stops that being mandatory.
+             */
+            ComboBox {
+                id: guestPicker
+                Layout.preferredWidth: 240
+                Layout.preferredHeight: Theme.controlHeight
+                font.pixelSize: Theme.fontBody
+                textRole: "label"
+                valueRole: "id"
+                enabled: root.guests && root.guests.count > 0
+                Material.foreground: Theme.textPrimary
+                Material.accent: Theme.primary
+
+                /* "(host only)" first, then every guest. Rebuilt whenever the
+                   list changes so a guest appearing or disappearing does not
+                   silently shift the selection onto a different one. */
+                model: ListModel { id: pickerModel }
+
+                function rebuild() {
+                    var keep = root.guestId;
+                    pickerModel.clear();
+                    pickerModel.append({ label: "Host only", id: "" });
+                    if (root.guests) {
+                        for (var i = 0; i < root.guests.count; ++i) {
+                            var g = root.guests.get(i);
+                            pickerModel.append({
+                                label: g.id + (g.running ? "" : "  (stopped)"),
+                                id: g.id
+                            });
+                        }
+                    }
+                    for (var j = 0; j < pickerModel.count; ++j)
+                        if (pickerModel.get(j).id === keep) { currentIndex = j; return }
+                    currentIndex = 0;
+                }
+
+                onActivated: {
+                    var id = pickerModel.get(currentIndex).id;
+                    if (id === "") { root.setGuest("", "", "", false); return }
+                    for (var i = 0; i < root.guests.count; ++i) {
+                        var g = root.guests.get(i);
+                        if (g.id === id) { root.setGuest(g.id, g.name, g.ip, g.running); return }
+                    }
+                }
+
+                Component.onCompleted: rebuild()
+
+                Connections {
+                    target: root.guests
+                    function onCountChanged() { guestPicker.rebuild() }
+                }
             }
 
             Switch {
@@ -484,7 +549,8 @@ Item {
                         Text {
                             Layout.fillWidth: true
                             visible: root.guestId === ""
-                            text: "No guest selected. Click a row on the Guests page to monitor it alongside the host."
+                            text: "No guest selected — pick one from the list above, "
+                                + "or click a guest row on the Guests page."
                             color: Theme.textSecondary
                             font.pixelSize: Theme.fontBody
                             wrapMode: Text.Wrap

@@ -732,6 +732,7 @@ ApplicationWindow {
 
             GuestMonitor {
                 id: monitorPage
+                guests: guestsModel
                 /* Also gated on the window being on screen: polling costs a
                    `top` plus an SSH on the host and a few hundred lines of
                    parsing here, and none of that is worth doing for a window
