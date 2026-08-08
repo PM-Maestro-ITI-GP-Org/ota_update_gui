@@ -304,10 +304,19 @@ ApplicationWindow {
                 return;
             }
             var previousId = selectedGuestId;
-            guestsModel.clear();
+
+            /* Updated in place rather than cleared and rebuilt.
+               HMS now pushes this list whenever anything about a guest
+               changes, not just when Refresh is pressed, so this runs on its
+               own several times during a single boot. clear() destroys and
+               recreates every delegate, which throws away the ListView's
+               scroll position and flashes the whole table each time -- barely
+               noticeable once, very noticeable when a guest coming up emits
+               several updates in a row. set() leaves the rows alone and
+               repaints only the properties that actually differ. */
             for (var i = 0; i < obj.guests.length; ++i) {
                 var g = obj.guests[i];
-                guestsModel.append({
+                var row = {
                     id: g.id,
                     name: g.name || "-",
                     type: g.type,
@@ -319,8 +328,14 @@ ApplicationWindow {
                        Older HMS builds omit the field; treat that as reachable
                        so this does not disable the shell against them. */
                     reachable: g.reachable !== false
-                });
+                };
+                if (i < guestsModel.count) guestsModel.set(i, row);
+                else                       guestsModel.append(row);
             }
+            /* Drop any trailing rows left by a guest that has gone away. */
+            while (guestsModel.count > obj.guests.length)
+                guestsModel.remove(guestsModel.count - 1);
+
             /* Keep the selection on the same guest across a refresh. It used to
                be kept by index, so a guest appearing or disappearing silently
                moved every subsequent action onto a different guest. */
@@ -330,7 +345,8 @@ ApplicationWindow {
 
             guestsLoading = false;
             lastUpdateText = "Updated " + Qt.formatTime(new Date(), "hh:mm:ss");
-            log("info", "Guest list: " + guestsModel.count + " guest(s).");
+            /* Not logged any more: this arrives on every change now, and one
+               "Guest list: 2 guest(s)" per update buries everything else. */
         }
 
         onGuestInfoReceived: (json) => {
