@@ -18,6 +18,15 @@ class MqttClient : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(bool connected READ isConnected NOTIFY connectedChanged)
+
+    /* Whether the BOARD is alive -- which is a different question from
+       `connected`, and confusing the two is why switching the RPi off used to
+       leave the GUI looking perfectly healthy. `connected` is this app's own
+       link to the broker, and the broker is on the internet: it stays up
+       whatever happens to the board. hostOnline is driven by HMS's heartbeat
+       and by the retained will the broker publishes when the board stops
+       talking. */
+    Q_PROPERTY(bool hostOnline READ hostOnline NOTIFY hostOnlineChanged)
     Q_PROPERTY(QString statusText READ statusText NOTIFY statusTextChanged)
     Q_PROPERTY(QString broker READ broker CONSTANT)
     Q_PROPERTY(QString serverUserHost READ serverUserHost CONSTANT)
@@ -88,6 +97,14 @@ public:
 
 signals:
     void connectedChanged();
+    void hostOnlineChanged();
+
+    /* One per beat actually received, so the UI can show a live pulse rather
+       than a static dot that looks identical whether the link is healthy or
+       frozen. Emitted only for real "host" beats, not for ordinary replies --
+       a pulse that fired on every message would flicker at the rate of
+       whatever else is going on and stop meaning anything. */
+    void heartbeat();
     void statusTextChanged();
     void logMessage(const QString &text, const QString &type);
     void guestListReceived(const QString &json);
@@ -123,8 +140,20 @@ private:
     void teardownClient();
     static bool removeDirRecursive(const QString &path);
 
+public:
+    bool hostOnline() const;
+
 private:
+    void setHostOnline(bool online);
+
     bool m_connected = false;
+
+    /* Starts false: until a beat or a retained marker arrives we do not know
+       the board is there, and claiming it is would be the very bug this
+       exists to fix. */
+    bool m_hostOnline = false;
+    QTimer *m_hostWatchdog = nullptr;
+
     QString m_statusText;
 
 #ifdef HAVE_MQTT

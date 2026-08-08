@@ -114,6 +114,43 @@ MqttClient::MqttClient(QObject *parent)
     m_reconnectTimer->setSingleShot(true);
     m_reconnectTimer->setInterval(5000);
     connect(m_reconnectTimer, &QTimer::timeout, this, &MqttClient::attemptReconnect);
+
+    /*
+     * Host watchdog: if nothing is heard from HMS for this long, the board is
+     * treated as gone.
+     *
+     * 3500ms against a 1000ms beat, so it takes three consecutive misses. Two
+     * would trip on a single hiccup over the ~145ms link to the broker; much
+     * more and switching the board off stops feeling immediate. Restarted on
+     * every message, so the countdown only runs during actual silence.
+     */
+    m_hostWatchdog = new QTimer(this);
+    m_hostWatchdog->setSingleShot(true);
+    m_hostWatchdog->setInterval(3500);
+    connect(m_hostWatchdog, &QTimer::timeout, this, [this]() {
+        if (m_hostOnline)
+            emitLog("Host stopped responding — no heartbeat for 3.5s.", "error");
+        setHostOnline(false);
+    });
+}
+
+bool MqttClient::hostOnline() const { return m_hostOnline; }
+
+void MqttClient::setHostOnline(bool online)
+{
+    if (online) {
+        /* Every message counts as a sign of life, so the timer is rearmed even
+           when the state itself has not changed. */
+        m_hostWatchdog->start();
+    } else {
+        m_hostWatchdog->stop();
+    }
+
+    if (m_hostOnline == online) return;
+
+    m_hostOnline = online;
+    if (online) emitLog("Host is online.", "success");
+    emit hostOnlineChanged();
 }
 
 MqttClient::~MqttClient()
@@ -164,6 +201,13 @@ void MqttClient::setConnected(bool c)
 {
     if (m_connected != c) {
         m_connected = c;
+
+        /* Losing the broker means losing the only channel that could tell us
+           anything about the board. Whatever it was doing, we no longer know
+           -- so stop claiming it is online rather than leaving a stale green
+           light on screen. */
+        if (!c) setHostOnline(false);
+
         emit connectedChanged();
     }
 }
@@ -460,6 +504,21 @@ void MqttClient::handleStatusMessage(const QString &payload)
             m_pendingCmd.clear();
         }
     };
+
+    /* Liveness first, and it never touches m_pendingCmd: a beat is not a reply
+       to anything, so letting it clear a pending command would make an
+       unrelated timeout disappear once a second. */
+    if (state == "host") {
+        const bool online = obj.value("online").toBool(false);
+        setHostOnline(online);
+        if (online) emit heartbeat();
+        return;
+    }
+
+    /* Anything at all from HMS proves it is alive, so treat it as a beat. This
+       keeps the light steady through a slow `ota` or a big `stats` even if a
+       beat or two is lost behind the traffic. */
+    setHostOnline(true);
 
     if (state == "guest_list") {
         clearIfPending("list");

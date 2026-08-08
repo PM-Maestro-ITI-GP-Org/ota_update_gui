@@ -569,6 +569,63 @@ ApplicationWindow {
                 }
             }
 
+            /* Board state -- deliberately a SEPARATE pill from the broker one
+               above. They answer different questions, and merging them is what
+               made a powered-off board look fine: the broker is on the
+               internet and stays reachable no matter what the RPi does. */
+            Rectangle {
+                Layout.preferredHeight: 40
+                Layout.preferredWidth: hostRow.implicitWidth + 28
+                radius: 20
+                color: mqtt.hostOnline ? Theme.successSoft : Theme.dangerSoft
+
+                RowLayout {
+                    id: hostRow
+                    anchors.centerIn: parent
+                    spacing: Theme.spacingTight
+
+                    /* The live pulse. Each beat drives it briefly bright and
+                       wide, so a healthy link visibly ticks about once a
+                       second and a frozen one is obvious at a glance -- a
+                       static dot looks the same either way. */
+                    Rectangle {
+                        id: beatDot
+                        implicitWidth: 10; implicitHeight: 10
+                        radius: 5
+                        color: mqtt.hostOnline ? Theme.success : Theme.danger
+                        opacity: mqtt.hostOnline ? 0.45 : 1.0
+
+                        SequentialAnimation {
+                            id: beatPulse
+                            NumberAnimation { target: beatDot; property: "opacity"
+                                              to: 1.0; duration: 90 }
+                            NumberAnimation { target: beatDot; property: "opacity"
+                                              to: 0.45; duration: 550 }
+                        }
+
+                        /* Blink steadily while offline, instead of the pulse. */
+                        SequentialAnimation on scale {
+                            running: !mqtt.hostOnline
+                            loops: Animation.Infinite
+                            NumberAnimation { to: 1.35; duration: 500 }
+                            NumberAnimation { to: 1.0;  duration: 500 }
+                        }
+                    }
+
+                    Text {
+                        text: mqtt.hostOnline ? "Board live" : "BOARD OFFLINE"
+                        color: mqtt.hostOnline ? Theme.success : Theme.danger
+                        font.pixelSize: Theme.fontSmall
+                        font.weight: Font.DemiBold
+                    }
+                }
+
+                Connections {
+                    target: mqtt
+                    function onHeartbeat() { beatPulse.restart() }
+                }
+            }
+
             ToolButton {
                 text: Theme.dark ? "☀" : "☾"
                 font.pixelSize: Theme.fontTitle
