@@ -12,6 +12,12 @@
 #define MQTT_USER "mqttuser"
 #define MQTT_PASS "123456"
 
+/* Exactly-once, matching HMS_MQTT_QOS in the host's mqtt_client.h. QoS 2 is a
+ * four-part handshake per message, so on a ~145ms link each publish costs
+ * about half a second of round trips -- paid for no duplicated commands and
+ * no lost results. */
+#define HMS_MQTT_QOS 2
+
 #define CMD_TOPIC "hms/cmd"
 #define STATUS_TOPIC "hms/status"
 
@@ -46,6 +52,14 @@ static void on_connection_lost(void *context, char *cause)
     QMetaObject::invokeMethod(self, [self]() {
         self->onConnectionLost();
     }, Qt::QueuedConnection);
+}
+
+/* Required once we publish above QoS 0: Paho hands back the delivery token
+ * when the QoS 2 exchange finishes, and with no callback set the tokens are
+ * never retired. Nothing here needs the token itself. */
+static void on_delivered(void *context, MQTTClient_deliveryToken t)
+{
+    (void)context; (void)t;
 }
 
 static int on_message(void *context, char *topicName, int topicLen,
@@ -202,11 +216,11 @@ void MqttClient::connectToBroker()
     opts.username = MQTT_USER;
     opts.password = MQTT_PASS;
 
-    MQTTClient_setCallbacks(m_client, this, on_connection_lost, on_message, nullptr);
+    MQTTClient_setCallbacks(m_client, this, on_connection_lost, on_message, on_delivered);
 
     rc = MQTTClient_connect(m_client, &opts);
     if (rc == MQTTCLIENT_SUCCESS) {
-        MQTTClient_subscribe(m_client, STATUS_TOPIC, 0);
+        MQTTClient_subscribe(m_client, STATUS_TOPIC, HMS_MQTT_QOS);
         m_reconnectTimer->stop();
         m_reconnectAttempts = 0;
         setConnected(true);
@@ -275,7 +289,8 @@ void MqttClient::publishCommand(const QString &cmd)
     }
     QByteArray utf8 = cmd.toUtf8();
     fprintf(stderr, "[GUI] >> %s : %s\n", CMD_TOPIC, cmd.toUtf8().constData());
-    MQTTClient_publish(m_client, CMD_TOPIC, utf8.size(), utf8.constData(), 0, false, nullptr);
+    MQTTClient_publish(m_client, CMD_TOPIC, utf8.size(), utf8.constData(),
+                       HMS_MQTT_QOS, false, nullptr);
     m_pendingCmd = cmd;
     m_cmdTimer->start(m_timeoutSec * 1000);
 #else
@@ -341,7 +356,8 @@ void MqttClient::publishNoWait(const QString &cmd)
     }
     QByteArray utf8 = cmd.toUtf8();
     fprintf(stderr, "[GUI] >> %s : %s\n", CMD_TOPIC, cmd.toUtf8().constData());
-    MQTTClient_publish(m_client, CMD_TOPIC, utf8.size(), utf8.constData(), 0, false, nullptr);
+    MQTTClient_publish(m_client, CMD_TOPIC, utf8.size(), utf8.constData(),
+                       HMS_MQTT_QOS, false, nullptr);
 #else
     (void)cmd;
 #endif
