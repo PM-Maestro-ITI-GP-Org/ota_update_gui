@@ -31,7 +31,11 @@ Item {
     /* 5s, not 3s. Each poll parses a few hundred lines of `top`/`pidin` output
        in JS on the GUI thread and then refills two list models, so the interval
        is a direct tax on how responsive the whole app feels. */
-    property int  pollIntervalMs: 5000
+    /* 15s, not 5s. A poll SSHes into the guest and the round trip measures
+       ~21s on the board, so a 5s timer only ever queued work that the
+       requestInFlight guard then threw away -- and made the CPU% deltas, which
+       are computed against this interval, wrong whenever one did get through. */
+    property int  pollIntervalMs: 15000
 
     /* Only the busiest processes are worth showing, and the cost of the refill
        is proportional to how many rows there are. A QNX host reports hundreds;
@@ -583,15 +587,27 @@ Item {
                             wrapMode: Text.Wrap
                         }
 
+                        /* Shown when the guest is stopped, AND when it is running
+                           but the stats could not be collected.
+
+                           This used to be gated on !guestRunning alone, which
+                           was fine only while HMS reported a failed stats fetch
+                           as "not running". Now that those are two separate
+                           facts, a running guest whose fetch failed fell
+                           between them: empty tiles, an empty process table,
+                           and not a word about why. */
                         ColumnLayout {
                             Layout.fillWidth: true
-                            visible: root.guestId !== "" && !root.guestRunning
+                            visible: root.guestId !== ""
+                                     && (!root.guestRunning || root.guestError !== "")
                             spacing: 4
 
                             Text {
                                 Layout.fillWidth: true
                                 text: root.guestError !== ""
-                                    ? "No statistics for this guest — HMS could not reach it over SSH."
+                                    ? (root.guestRunning
+                                        ? "Guest is running, but HMS could not collect statistics from it."
+                                        : "No statistics for this guest — HMS could not reach it over SSH.")
                                     : "Guest is not running — nothing to report."
                                 color: Theme.warning
                                 font.pixelSize: Theme.fontBody
@@ -667,7 +683,22 @@ Item {
 
     Timer {
         id: watchdog
-        interval: 15000
+        /*
+         * Must outlast HMS's own ssh cap, or this gives up on every single
+         * guest poll.
+         *
+         * It was 15s while a guest stats round trip measures ~21s on the board
+         * -- the ssh handshake into the guest alone is ~10s. So the watchdog
+         * fired first, every time, cleared requestInFlight, printed "No
+         * response", and let the poll timer fire a fresh request that the reply
+         * to the previous one then raced. The Monitor never settled even when
+         * HMS answered perfectly.
+         *
+         * HMS kills its own ssh at 45s and replies immediately after, so 60s
+         * leaves room for that plus the round trip to the broker. This is the
+         * backstop for HMS being gone entirely, not a latency budget.
+         */
+        interval: 60000
         repeat: false
         onTriggered: {
             root.requestInFlight = false
