@@ -145,6 +145,19 @@ private:
 public:
     bool hostOnline() const;
 
+    /*
+     * Diagnostic trace: milliseconds since start, thread id, tag, message.
+     *
+     * Written to ~/ota_gui_diag.log as well as stderr, and flushed on every
+     * line -- a hang is exactly the case where a buffered log tells you
+     * nothing, because the interesting part never reaches the disk.
+     *
+     * The thread id is there on purpose. Three threads touch this program's
+     * state -- the GUI, Paho's receive thread, and the MQTT worker -- and
+     * "which thread was that on" is the question a freeze usually turns on.
+     */
+    Q_INVOKABLE void diag(const QString &tag, const QString &msg);
+
 private:
     void setHostOnline(bool online);
 

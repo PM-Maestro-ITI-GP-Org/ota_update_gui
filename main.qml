@@ -787,6 +787,7 @@ ApplicationWindow {
             Layout.fillHeight: true
             Layout.margins: Theme.spacingLoose
             currentIndex: app.currentPage
+            onCurrentIndexChanged: mqtt.diag("page", "switched to index " + currentIndex)
 
             GuestsPage {
                 mqtt: mqtt; app: app; guestsModel: guestsModel
@@ -810,6 +811,7 @@ ApplicationWindow {
             }
 
             GuestMonitor {
+            mqttRef: mqtt
                 id: monitorPage
                 guests: guestsModel
                 /* Also gated on the window being on screen: polling costs a

@@ -4,6 +4,8 @@
 #include <QFileInfo>
 #include <QStandardPaths>
 #include <QCoreApplication>
+#include <QThread>
+#include <QElapsedTimer>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -40,6 +42,7 @@ static void on_connection_lost(void *context, char *cause)
 {
     auto *self = static_cast<MqttClient *>(context);
     fprintf(stderr, "[MQTT] Connection lost: %s\n", cause ? cause : "unknown");
+    self->diag("LOST", QString("cause=%1").arg(cause ? cause : "(null)"));
 
     /*
      * This is where reconnection was dying. The old body called
@@ -70,6 +73,9 @@ static int on_message(void *context, char *topicName, int topicLen,
     QString topic = QString::fromUtf8(topicName, tlen);
     QString payload = QString::fromUtf8(
         static_cast<char *>(message->payload), message->payloadlen);
+    self->diag("rx", QString("%1 bytes, state=%2")
+                        .arg(message->payloadlen)
+                        .arg(payload.section("\"state\":\"", 1, 1).section('"', 0, 0)));
 
     fprintf(stderr, "[MQTT] << %s : %s\n", qPrintable(topic), payload.left(160).toUtf8().constData());
 
@@ -148,6 +154,26 @@ MqttClient::MqttClient(QObject *parent)
     });
 }
 
+static FILE       *g_diagFile = nullptr;
+static QElapsedTimer g_diagClock;
+
+void MqttClient::diag(const QString &tag, const QString &msg)
+{
+    if (!g_diagClock.isValid()) {
+        g_diagClock.start();
+        const QString path = QDir::homePath() + "/ota_gui_diag.log";
+        g_diagFile = fopen(path.toUtf8().constData(), "w");
+        fprintf(stderr, "[diag] tracing to %s\n", qPrintable(path));
+    }
+    const QString line = QString("%1  t%2  %3  %4")
+        .arg(g_diagClock.elapsed(), 8)
+        .arg((quintptr)QThread::currentThreadId(), 6, 16, QLatin1Char('0'))
+        .arg(tag, -14)
+        .arg(msg);
+    fprintf(stderr, "[diag] %s\n", qPrintable(line));
+    if (g_diagFile) { fprintf(g_diagFile, "%s\n", qPrintable(line)); fflush(g_diagFile); }
+}
+
 bool MqttClient::hostOnline() const { return m_hostOnline; }
 
 void MqttClient::setHostOnline(bool online)
@@ -207,6 +233,7 @@ void MqttClient::teardownClient()
 
 void MqttClient::onConnectionLost()
 {
+    diag("link", "onConnectionLost — clearing pending, scheduling reconnect");
     /* Clear the flag first: scheduleReconnect() refuses to do anything while
        it is still set, which is what stopped the GUI ever coming back. */
     setConnected(false);
@@ -424,10 +451,14 @@ void MqttClient::publishCommand(const QString &cmd)
     m_pendingCmd = cmd;
     m_cmdTimer->start(m_timeoutSec * 1000);
 
+    diag("publish", QString("cmd='%1' pending='%2'").arg(cmd, m_pendingCmd));
+
     onMqttThread([this, utf8, cmd]() {
-        if (!m_client) return;
+        if (!m_client) { diag("publish", "NO CLIENT — dropped"); return; }
+        diag("publish", QString("calling MQTTClient_publish for '%1'").arg(cmd));
         int rc = MQTTClient_publish(m_client, CMD_TOPIC, utf8.size(), utf8.constData(),
                                     HMS_MQTT_QOS, false, nullptr);
+        diag("publish", QString("returned rc=%1 for '%2'").arg(rc).arg(cmd));
         if (rc == MQTTCLIENT_SUCCESS) return;
 
         fprintf(stderr, "[GUI] publish of '%s' failed: %d\n",
@@ -446,6 +477,7 @@ void MqttClient::publishCommand(const QString &cmd)
 
 void MqttClient::onCmdTimeout()
 {
+    diag("cmd-timeout", QString("pending='%1'").arg(m_pendingCmd));
     fprintf(stderr, "[GUI] TIMEOUT: no response for '%s'\n", m_pendingCmd.toUtf8().constData());
     /* Not "check that hms is running". The usual cause is that it *is*
        running and has no network yet: hms starts early in the board's boot
@@ -588,6 +620,7 @@ void MqttClient::guestFiles(const QString &id)
 
 void MqttClient::handleStatusMessage(const QString &payload)
 {
+    diag("dispatch", QString("%1 chars").arg(payload.size()));
     QJsonDocument doc = QJsonDocument::fromJson(payload.toUtf8());
     QJsonObject obj = doc.object();
     QString state = obj.value("state").toString();

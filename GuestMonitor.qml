@@ -22,6 +22,9 @@ Item {
     id: root
 
     property bool active: false
+    /* Set by main.qml. Only used for diag() -- the page never talks to MQTT
+       directly, it goes through the requestStats signal. */
+    property var mqttRef: null
     property bool autoRefresh: true
 
     /* Set by main.qml; drives the guest picker in the header. Named `guests`,
@@ -86,6 +89,7 @@ Item {
     }
 
     function setGuest(id, name, ip, running) {
+        if (mqttRef) mqttRef.diag("monitor", "setGuest('" + id + "') was='" + guestId + "' inFlight=" + requestInFlight)
         requestInFlight = false
         watchdog.stop()
         guestId = id
@@ -131,8 +135,11 @@ Item {
          */
         var replyFor = (obj.guest_id === undefined || obj.guest_id === null)
                        ? "" : obj.guest_id
-        if (replyFor !== guestId)
+        if (replyFor !== guestId) {
+            if (mqttRef) mqttRef.diag("monitor", "DROP reply for '" + replyFor + "', showing '" + guestId + "'")
             return
+        }
+        if (mqttRef) mqttRef.diag("monitor", "accept reply for '" + replyFor + "'")
 
         requestInFlight = false
         watchdog.stop()
@@ -182,6 +189,7 @@ Item {
      * Clear the in-flight state and ask again immediately.
      */
     function onLinkChanged(up) {
+        if (mqttRef) mqttRef.diag("monitor", "link " + (up ? "up" : "down") + " inFlight=" + requestInFlight)
         requestInFlight = false
         watchdog.stop()
         if (!up) {
@@ -193,6 +201,7 @@ Item {
     }
 
     function refreshNow() {
+        if (mqttRef) mqttRef.diag("monitor", "refreshNow('" + guestId + "') inFlight=" + requestInFlight + " active=" + active)
         if (requestInFlight) return
         requestInFlight = true
         statusText = "Fetching…"
@@ -747,12 +756,16 @@ Item {
         interval: 60000
         repeat: false
         onTriggered: {
+            if (root.mqttRef) root.mqttRef.diag("monitor", "WATCHDOG fired for '" + root.guestId + "'")
             root.requestInFlight = false
             root.statusText = "No response — will retry"
         }
     }
 
     onActiveChanged: {
+        if (mqttRef)
+            mqttRef.diag("monitor", "active=" + active + " inFlight=" + requestInFlight
+                                    + " guest='" + guestId + "'")
         if (active) refreshNow()
         else { requestInFlight = false; watchdog.stop() }
     }
