@@ -528,14 +528,45 @@ void MqttClient::execCommand(const QString &id, const QString &command)
 void MqttClient::publishNoWait(const QString &cmd)
 {
 #ifdef HAVE_MQTT
+    diag("publish-nw", QString("requested '%1'").arg(cmd));
     if (!m_connected || !m_client) {
         emitLog("Cannot send command: not connected.", "error");
         return;
     }
     QByteArray utf8 = cmd.toUtf8();
     fprintf(stderr, "[GUI] >> %s : %s\n", CMD_TOPIC, cmd.toUtf8().constData());
-    MQTTClient_publish(m_client, CMD_TOPIC, utf8.size(), utf8.constData(),
-                       HMS_MQTT_QOS, false, nullptr);
+
+    /*
+     * On the MQTT thread, exactly like publishCommand.
+     *
+     * This called MQTTClient_publish straight from the GUI thread, and it is
+     * the ONLY caller path the Monitor uses -- guestStats() goes through here,
+     * everything else goes through publishCommand(). So moving publishCommand
+     * to its own thread fixed every feature except the one that was broken.
+     *
+     * The trace says it plainly. Selecting a guest:
+     *
+     *     12716  monitor  setGuest('guest-1')
+     *     12717  monitor  refreshNow('guest-1')
+     *            >> hms/cmd : stats guest-1
+     *     27851  monitor  link down
+     *
+     * Fifteen seconds with no output from ANY thread -- not the GUI, not the
+     * MQTT worker, and not Paho's receive thread, which had been logging a
+     * heartbeat every second right up to that line. The GUI thread went into
+     * Paho while Paho's own thread was delivering, and took the whole client
+     * down with it.
+     */
+    onMqttThread([this, utf8, cmd]() {
+        if (!m_client) { diag("publish-nw", "NO CLIENT — dropped"); return; }
+        diag("publish-nw", QString("calling MQTTClient_publish for '%1'").arg(cmd));
+        int rc = MQTTClient_publish(m_client, CMD_TOPIC, utf8.size(), utf8.constData(),
+                                    HMS_MQTT_QOS, false, nullptr);
+        diag("publish-nw", QString("returned rc=%1 for '%2'").arg(rc).arg(cmd));
+        if (rc != MQTTCLIENT_SUCCESS)
+            fprintf(stderr, "[GUI] publish of '%s' failed: %d\n",
+                    cmd.toUtf8().constData(), rc);
+    });
 #else
     (void)cmd;
 #endif
