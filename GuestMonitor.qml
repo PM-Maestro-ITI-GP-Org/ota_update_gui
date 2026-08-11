@@ -166,6 +166,30 @@ Item {
         }
     }
 
+    /*
+     * The broker went away and came back.
+     *
+     * A request that was outstanding when the link dropped is never answered:
+     * HMS's reply went to a session that no longer exists. requestInFlight
+     * stayed true through all of it, so the page sat with Refresh disabled and
+     * "No respon." on the button until its own 60s watchdog expired -- long
+     * after the client had reconnected two seconds later and everything was
+     * working again. That wait is the whole visible cost of a dropped
+     * connection, and it is entirely self-inflicted.
+     *
+     * Clear the in-flight state and ask again immediately.
+     */
+    function onLinkChanged(up) {
+        requestInFlight = false
+        watchdog.stop()
+        if (!up) {
+            statusText = "Link lost"
+            return
+        }
+        statusText = ""
+        if (active) refreshNow()
+    }
+
     function refreshNow() {
         if (requestInFlight) return
         requestInFlight = true

@@ -395,6 +395,12 @@ ApplicationWindow {
         onAddFileResult:  (guest, success, msg) => { if (success) refreshPartitions() }
 
         onGuestStatsReceived: (json) => monitorPage.onStats(json)
+
+        /* A reply outstanding when the link dropped is never coming -- the
+           session it was addressed to is gone. Tell the Monitor so it stops
+           waiting on it; otherwise it sits out its 60s watchdog while the
+           client has already reconnected. */
+        onConnectedChanged: monitorPage.onLinkChanged(mqtt.connected)
         onGuestFilesReceived: (json) => loadPartitions(json)
 
         onUploadProgress: (percent, fileName) => {
