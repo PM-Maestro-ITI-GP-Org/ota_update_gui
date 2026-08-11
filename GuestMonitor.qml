@@ -109,31 +109,33 @@ Item {
             statusText = "Parse error: " + e.message
             return
         }
-        requestInFlight = false
-        watchdog.stop()
-
         /*
-         * A reply to a request made before the selection changed.
+         * Is this reply for what the page is showing NOW?
          *
-         * Discarding it is right -- it describes a guest the page is no longer
-         * showing -- but discarding it and stopping there was what made
-         * switching guests look like a hang. HMS used to coalesce the request
-         * sent on the switch against the one already running, so nothing was
-         * ever coming: the page sat on "Fetching..." with Refresh disabled
-         * until the 60s watchdog. HMS now coalesces per target and answers
-         * both, so this is only the ordering case -- ask again rather than
-         * wait, and the page recovers in one round trip instead of one poll.
+         * The check comes BEFORE requestInFlight is cleared, and that ordering
+         * is the whole point. It used to be the other way round: any reply
+         * cleared the flag, and then a mismatched one called refreshNow() to
+         * ask again. Switching host -> guest -> host makes several replies
+         * arrive for targets that are no longer selected, and each one cleared
+         * the flag and fired a fresh request, whose reply could itself arrive
+         * mismatched after the next switch. A request storm, and the page
+         * hung parsing replies to questions nobody was asking any more.
+         *
+         * A reply for someone else is simply dropped now. Our own request is
+         * still outstanding -- the flag was never cleared -- so its reply lands
+         * normally, and the watchdog covers the case where it never does.
          *
          * A missing guest_id reads as "", which is what a host-only reply
-         * carries, so such a reply is no longer accepted while a guest is
-         * selected. It used to be, and it blanked the guest panel.
+         * carries, so such a reply is not accepted while a guest is selected.
+         * It used to be, and it blanked the guest panel.
          */
         var replyFor = (obj.guest_id === undefined || obj.guest_id === null)
                        ? "" : obj.guest_id
-        if (replyFor !== guestId) {
-            refreshNow()
+        if (replyFor !== guestId)
             return
-        }
+
+        requestInFlight = false
+        watchdog.stop()
 
         lastUpdated = Qt.formatTime(new Date(), "hh:mm:ss")
         statusText = ""
