@@ -94,6 +94,13 @@ MqttClient::MqttClient(QObject *parent)
 {
     m_cmdTimer->setSingleShot(true);
     connect(m_cmdTimer, &QTimer::timeout, this, &MqttClient::onCmdTimeout);
+
+    /* The one thread every Paho call runs on. Created before anything can
+       publish, torn down last -- see the destructor. */
+    m_mqttThread = new QThread();
+    m_mqttWorker = new QObject();          /* no parent: it lives on that thread */
+    m_mqttWorker->moveToThread(m_mqttThread);
+    m_mqttThread->start();
     /*
      * MQTTClient_yield() used to be called here on a timer. It is gone, and
      * removing it is what stopped the Monitor page killing the connection.
@@ -160,9 +167,28 @@ void MqttClient::setHostOnline(bool online)
     emit hostOnlineChanged();
 }
 
+/* Run fn on the MQTT thread. Queued, so the caller never blocks -- which is
+   the point for connect(), and harmless for publish(). */
+void MqttClient::onMqttThread(std::function<void()> fn)
+{
+    if (!m_mqttWorker) { fn(); return; }
+    QMetaObject::invokeMethod(m_mqttWorker, std::move(fn), Qt::QueuedConnection);
+}
+
 MqttClient::~MqttClient()
 {
-    teardownClient();
+    /* Blocking, deliberately: the handle must be destroyed on the thread that
+       owns it, and before that thread goes away. */
+    if (m_mqttWorker && m_mqttThread && m_mqttThread->isRunning()) {
+        QMetaObject::invokeMethod(m_mqttWorker, [this]() { teardownClient(); },
+                                  Qt::BlockingQueuedConnection);
+        m_mqttThread->quit();
+        m_mqttThread->wait(3000);
+    } else {
+        teardownClient();
+    }
+    delete m_mqttWorker;
+    delete m_mqttThread;
 }
 
 /* Drop the Paho handle if there is one. Safe to call when there is not. */
@@ -242,94 +268,99 @@ void MqttClient::connectToBroker()
     /* Reconnecting calls straight back into here, so an old handle from the
        previous attempt has to go before MQTTClient_create() overwrites the
        member and loses it. */
-    teardownClient();
+    /*
+     * Paho on the MQTT thread; every Qt touch marshalled back.
+     *
+     * MQTTClient_connect blocks for up to connectTimeout (5s), so on the GUI
+     * thread it froze the app on each reconnect attempt. But the results have
+     * to come home: QTimer cannot be started or stopped from a thread that
+     * does not own it, and scheduleReconnect()/refreshGuests() both do exactly
+     * that. Hence the split -- Paho below, Qt in the continuation.
+     */
+    onMqttThread([this]() {
+        teardownClient();
 
-    const QString clientId =
-        "ota_gui_" + QString::number(QDateTime::currentMSecsSinceEpoch());
-    const QByteArray clientIdUtf8 = clientId.toUtf8();
+        const QString clientId =
+            "ota_gui_" + QString::number(QDateTime::currentMSecsSinceEpoch());
+        const QByteArray clientIdUtf8 = clientId.toUtf8();
 
-    int rc = MQTTClient_create(&m_client, MQTT_BROKER, clientIdUtf8.constData(),
-                              MQTTCLIENT_PERSISTENCE_NONE, nullptr);
-    if (rc != MQTTCLIENT_SUCCESS) {
-        fprintf(stderr, "[GUI] MQTTClient_create failed: %d\n", rc);
-        emitLog("Failed to create MQTT client.", "error");
-        setStatusText("Create failed");
-        m_client = nullptr;
-        scheduleReconnect();
-        return;
-    }
+        int rc = MQTTClient_create(&m_client, MQTT_BROKER, clientIdUtf8.constData(),
+                                   MQTTCLIENT_PERSISTENCE_NONE, nullptr);
+        if (rc != MQTTCLIENT_SUCCESS) {
+            fprintf(stderr, "[GUI] MQTTClient_create failed: %d\n", rc);
+            m_client = nullptr;
+            QMetaObject::invokeMethod(this, [this, rc]() {
+                emitLog(QString("Failed to create MQTT client (%1).").arg(rc), "error");
+                setStatusText("Create failed");
+                scheduleReconnect();
+            }, Qt::QueuedConnection);
+            return;
+        }
 
-    MQTTClient_connectOptions opts = MQTTClient_connectOptions_initializer;
-    opts.connectTimeout = 5;
-    opts.keepAliveInterval = 30;
-    opts.cleansession = 1;
-    opts.username = MQTT_USER;
-    opts.password = MQTT_PASS;
+        MQTTClient_connectOptions opts = MQTTClient_connectOptions_initializer;
+        opts.connectTimeout = 5;
+        opts.keepAliveInterval = 30;
+        opts.cleansession = 1;
+        opts.username = MQTT_USER;
+        opts.password = MQTT_PASS;
 
-    MQTTClient_setCallbacks(m_client, this, on_connection_lost, on_message, on_delivered);
+        MQTTClient_setCallbacks(m_client, this, on_connection_lost, on_message, on_delivered);
 
-    rc = MQTTClient_connect(m_client, &opts);
-    if (rc == MQTTCLIENT_SUCCESS) {
+        rc = MQTTClient_connect(m_client, &opts);
+        if (rc != MQTTCLIENT_SUCCESS) {
+            fprintf(stderr, "[GUI] MQTT connection failed (error %d)\n", rc);
+            teardownClient();
+            QMetaObject::invokeMethod(this, [this, rc]() {
+                setConnected(false);
+                setStatusText("Connection failed");
+                emitLog(QString("MQTT connection failed (error %1) — retrying.").arg(rc), "error");
+                scheduleReconnect();
+            }, Qt::QueuedConnection);
+            return;
+        }
+
         /*
          * QoS 1 inbound, deliberately, while commands still go out at QoS 2.
          *
-         * Subscribing at QoS 2 is what made the Monitor page kill the
-         * connection. Measured against the live broker, same board, same
-         * command, only the subscription QoS differing:
+         * Subscribing at QoS 2 made the Monitor page kill the connection.
+         * Measured against the live broker, same board, same command, only
+         * the subscription QoS differing:
          *
-         *     subscribe QoS 2 -> monitor_stats received 0, connection lost 1
-         *     subscribe QoS 1 -> monitor_stats received 1, connection lost 0
+         *     QoS 2 -> monitor_stats received 0, connection lost 1
+         *     QoS 1 -> monitor_stats received 1, connection lost 0
          *
-         * Every other message on hms/status is published QoS 0 -- the beat and
-         * the periodic guest list -- so the stats reply was the only inbound
-         * QoS 2 message in the system, and it dropped the session every time,
-         * roughly a minute after the page was opened:
-         *
-         *     [GUI] >> hms/cmd : stats
-         *     [MQTT] Connection lost: unknown
-         *
-         * with the reply never delivered and an ~80s reconnect gap behind it.
-         *
-         * Nothing is given up by dropping to 1. The inbound exactly-once
-         * guarantee was already worthless here: cleansession is 1 and the
-         * client has no persistence, so no QoS 2 state survives the reconnect
-         * that this very bug was causing. And every message on this topic is
-         * an idempotent snapshot -- a beat, a guest list, a stats reply -- so a
-         * duplicate is indistinguishable from the next poll.
-         *
-         * Commands keep HMS_MQTT_QOS. That direction is where duplicate
-         * delivery would actually cost something: a repeated start or ota.
+         * Nothing is given up: cleansession is 1 and there is no persistence,
+         * so no inbound QoS 2 state survives a reconnect anyway, and every
+         * message on this topic is an idempotent snapshot.
          *
          * Checked, too. An unchecked subscribe that fails gives a GUI showing
-         * "Connected", a green light, and no message ever arriving -- which
-         * looks like the board being dead rather than like a client fault.
+         * "Connected" with a green light and no message ever arriving.
          */
         int src = MQTTClient_subscribe(m_client, STATUS_TOPIC, 1);
         if (src != MQTTCLIENT_SUCCESS) {
             fprintf(stderr, "[GUI] subscribe to %s failed: %d\n", STATUS_TOPIC, src);
-            emitLog(QString("Subscribed to nothing — broker refused (error %1). "
-                            "Reconnecting.").arg(src), "error");
             teardownClient();
-            setConnected(false);
-            setStatusText("Subscribe failed");
-            scheduleReconnect();
+            QMetaObject::invokeMethod(this, [this, src]() {
+                setConnected(false);
+                setStatusText("Subscribe failed");
+                emitLog(QString("Subscribed to nothing — broker refused (error %1). "
+                                "Reconnecting.").arg(src), "error");
+                scheduleReconnect();
+            }, Qt::QueuedConnection);
             return;
         }
-        m_reconnectTimer->stop();
-        m_reconnectAttempts = 0;
-        setConnected(true);
-        setStatusText("Connected");
+
         fprintf(stderr, "[GUI] Connected to broker at " MQTT_BROKER "\n");
-        emitLog("Connected to broker.", "success");
-        refreshGuests();
-    } else {
-        setConnected(false);
-        setStatusText("Connection failed");
-        fprintf(stderr, "[GUI] MQTT connection failed (error %d)\n", rc);
-        emitLog(QString("MQTT connection failed (error %1) — retrying.").arg(rc), "error");
-        teardownClient();
-        scheduleReconnect();
-    }
+        QMetaObject::invokeMethod(this, [this]() {
+            m_reconnectTimer->stop();
+            m_reconnectAttempts = 0;
+            setConnected(true);
+            setStatusText("Connected");
+            emitLog("Connected to broker.", "success");
+            refreshGuests();
+        }, Qt::QueuedConnection);
+    });
+
 #else
     setStatusText("Demo mode");
     emitLog("MQTT not available — running in demo mode.", "warning");
@@ -386,18 +417,28 @@ void MqttClient::publishCommand(const QString &cmd)
        the command never leaves, the timeout below fires, and onCmdTimeout()
        then blames HMS for still starting up. MQTTCLIENT_MAX_MESSAGES_INFLIGHT
        is a documented return here at QoS 2, so this is not hypothetical. */
-    int rc = MQTTClient_publish(m_client, CMD_TOPIC, utf8.size(), utf8.constData(),
-                                HMS_MQTT_QOS, false, nullptr);
-    if (rc != MQTTCLIENT_SUCCESS) {
-        fprintf(stderr, "[GUI] publish of '%s' failed: %d\n",
-                cmd.toUtf8().constData(), rc);
-        emitLog(QString("Could not send '%1' — broker returned %2.")
-                    .arg(cmd.section(' ', 0, 0)).arg(rc), "error");
-        return;
-    }
-
+    /* Pending state is GUI-thread state, set here; the wire call goes to the
+       MQTT thread. Opening the Monitor publishes while a reply is being
+       delivered, and doing both on the same handle from two threads is what
+       killed the client outright. */
     m_pendingCmd = cmd;
     m_cmdTimer->start(m_timeoutSec * 1000);
+
+    onMqttThread([this, utf8, cmd]() {
+        if (!m_client) return;
+        int rc = MQTTClient_publish(m_client, CMD_TOPIC, utf8.size(), utf8.constData(),
+                                    HMS_MQTT_QOS, false, nullptr);
+        if (rc == MQTTCLIENT_SUCCESS) return;
+
+        fprintf(stderr, "[GUI] publish of '%s' failed: %d\n",
+                cmd.toUtf8().constData(), rc);
+        QMetaObject::invokeMethod(this, [this, cmd, rc]() {
+            m_cmdTimer->stop();
+            if (m_pendingCmd == cmd) m_pendingCmd.clear();
+            emitLog(QString("Could not send '%1' — broker returned %2.")
+                        .arg(cmd.section(' ', 0, 0)).arg(rc), "error");
+        }, Qt::QueuedConnection);
+    });
 #else
     (void)cmd;
 #endif

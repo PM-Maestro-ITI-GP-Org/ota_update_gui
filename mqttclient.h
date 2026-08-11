@@ -4,6 +4,8 @@
 #include <QObject>
 #include <QString>
 #include <QTimer>
+#include <QThread>
+#include <functional>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
@@ -159,6 +161,28 @@ private:
 #ifdef HAVE_MQTT
     MQTTClient m_client = nullptr;
 #endif
+    /*
+     * Every Paho call happens on this thread and nowhere else.
+     *
+     * Paho's synchronous MQTTClient API is not built for two threads. Setting
+     * callbacks gives the library its own receive thread, and the GUI thread
+     * was calling MQTTClient_publish on the same handle at the same time. It
+     * survived the small traffic and died on the Monitor: opening the page
+     * publishes `stats guest-1` while a reply is being delivered, and the
+     * client stopped dead -- not merely the reply, the heartbeats too:
+     *
+     *     [GUI] >> hms/cmd : stats guest-1
+     *     [GUI] >> hms/cmd : stats guest-1
+     *     (nothing, ever again)
+     *
+     * Marshalling every call onto one thread removes the race by
+     * construction, and takes the blocking 5s connect off the GUI thread as a
+     * side effect.
+     */
+    QThread *m_mqttThread = nullptr;
+    QObject *m_mqttWorker = nullptr;
+    void onMqttThread(std::function<void()> fn);
+
     QTimer *m_cmdTimer;
     QTimer *m_reconnectTimer;
     int m_reconnectAttempts = 0;
