@@ -160,7 +160,6 @@ private:
     MQTTClient m_client = nullptr;
 #endif
     QTimer *m_cmdTimer;
-    QTimer *m_yieldTimer;
     QTimer *m_reconnectTimer;
     int m_reconnectAttempts = 0;
     QString m_pendingCmd;

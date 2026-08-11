@@ -112,8 +112,28 @@ Item {
         requestInFlight = false
         watchdog.stop()
 
-        if (obj.guest_id && obj.guest_id !== "" && obj.guest_id !== guestId)
+        /*
+         * A reply to a request made before the selection changed.
+         *
+         * Discarding it is right -- it describes a guest the page is no longer
+         * showing -- but discarding it and stopping there was what made
+         * switching guests look like a hang. HMS used to coalesce the request
+         * sent on the switch against the one already running, so nothing was
+         * ever coming: the page sat on "Fetching..." with Refresh disabled
+         * until the 60s watchdog. HMS now coalesces per target and answers
+         * both, so this is only the ordering case -- ask again rather than
+         * wait, and the page recovers in one round trip instead of one poll.
+         *
+         * A missing guest_id reads as "", which is what a host-only reply
+         * carries, so such a reply is no longer accepted while a guest is
+         * selected. It used to be, and it blanked the guest panel.
+         */
+        var replyFor = (obj.guest_id === undefined || obj.guest_id === null)
+                       ? "" : obj.guest_id
+        if (replyFor !== guestId) {
+            refreshNow()
             return
+        }
 
         lastUpdated = Qt.formatTime(new Date(), "hh:mm:ss")
         statusText = ""

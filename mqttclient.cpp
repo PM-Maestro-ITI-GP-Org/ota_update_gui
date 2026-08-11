@@ -90,26 +90,33 @@ MqttClient::MqttClient(QObject *parent)
 #ifdef HAVE_MQTT
     , m_client(nullptr)
 #endif
-    , m_cmdTimer(new QTimer(this)), m_yieldTimer(new QTimer(this))
+    , m_cmdTimer(new QTimer(this))
 {
     m_cmdTimer->setSingleShot(true);
     connect(m_cmdTimer, &QTimer::timeout, this, &MqttClient::onCmdTimeout);
     /*
-     * 500ms, not 50.
+     * MQTTClient_yield() used to be called here on a timer. It is gone, and
+     * removing it is what stopped the Monitor page killing the connection.
      *
-     * Paho only requires MQTTClient_yield() when the client is *not* using
-     * callbacks; with MQTTClient_setCallbacks() the library runs its own
-     * receive thread and delivery does not depend on this at all. Twenty
-     * wake-ups a second on the GUI thread bought nothing. Kept at a slow tick
-     * rather than deleted outright so behaviour does not hinge on that
-     * reading being right.
+     * Paho's own header says what it is for:
+     *
+     *     "When implementing a single-threaded client, call this function
+     *      periodically to allow processing of message retries and to send
+     *      MQTT keepalive pings."
+     *
+     * This is not a single-threaded client. MQTTClient_setCallbacks() below
+     * makes Paho run its own receive thread, so yield() from the GUI thread was
+     * a second thread reading the same socket. A small packet arrives in one
+     * read and survives that; a large one does not. hms/status carries both --
+     * 40-byte heartbeats once a second, and a monitor_stats reply of tens of
+     * kilobytes -- so the race was invisible until the Monitor page was opened
+     * and then took the connection down every time:
+     *
+     *     [GUI] >> hms/cmd : stats
+     *     [MQTT] Connection lost: unknown
+     *
+     * with the reply never arriving and an ~80s reconnect gap after it.
      */
-    m_yieldTimer->setInterval(500);
-    connect(m_yieldTimer, &QTimer::timeout, this, []() {
-#ifdef HAVE_MQTT
-        MQTTClient_yield();
-#endif
-    });
     m_reconnectTimer = new QTimer(this);
     m_reconnectTimer->setSingleShot(true);
     m_reconnectTimer->setInterval(5000);
@@ -178,7 +185,6 @@ void MqttClient::onConnectionLost()
        it is still set, which is what stopped the GUI ever coming back. */
     setConnected(false);
     setStatusText("Connection lost — reconnecting...");
-    m_yieldTimer->stop();
     m_cmdTimer->stop();
     m_pendingCmd.clear();
     emitLog("Connection to broker lost — will reconnect.", "warning");
@@ -264,12 +270,55 @@ void MqttClient::connectToBroker()
 
     rc = MQTTClient_connect(m_client, &opts);
     if (rc == MQTTCLIENT_SUCCESS) {
-        MQTTClient_subscribe(m_client, STATUS_TOPIC, HMS_MQTT_QOS);
+        /*
+         * QoS 1 inbound, deliberately, while commands still go out at QoS 2.
+         *
+         * Subscribing at QoS 2 is what made the Monitor page kill the
+         * connection. Measured against the live broker, same board, same
+         * command, only the subscription QoS differing:
+         *
+         *     subscribe QoS 2 -> monitor_stats received 0, connection lost 1
+         *     subscribe QoS 1 -> monitor_stats received 1, connection lost 0
+         *
+         * Every other message on hms/status is published QoS 0 -- the beat and
+         * the periodic guest list -- so the stats reply was the only inbound
+         * QoS 2 message in the system, and it dropped the session every time,
+         * roughly a minute after the page was opened:
+         *
+         *     [GUI] >> hms/cmd : stats
+         *     [MQTT] Connection lost: unknown
+         *
+         * with the reply never delivered and an ~80s reconnect gap behind it.
+         *
+         * Nothing is given up by dropping to 1. The inbound exactly-once
+         * guarantee was already worthless here: cleansession is 1 and the
+         * client has no persistence, so no QoS 2 state survives the reconnect
+         * that this very bug was causing. And every message on this topic is
+         * an idempotent snapshot -- a beat, a guest list, a stats reply -- so a
+         * duplicate is indistinguishable from the next poll.
+         *
+         * Commands keep HMS_MQTT_QOS. That direction is where duplicate
+         * delivery would actually cost something: a repeated start or ota.
+         *
+         * Checked, too. An unchecked subscribe that fails gives a GUI showing
+         * "Connected", a green light, and no message ever arriving -- which
+         * looks like the board being dead rather than like a client fault.
+         */
+        int src = MQTTClient_subscribe(m_client, STATUS_TOPIC, 1);
+        if (src != MQTTCLIENT_SUCCESS) {
+            fprintf(stderr, "[GUI] subscribe to %s failed: %d\n", STATUS_TOPIC, src);
+            emitLog(QString("Subscribed to nothing — broker refused (error %1). "
+                            "Reconnecting.").arg(src), "error");
+            teardownClient();
+            setConnected(false);
+            setStatusText("Subscribe failed");
+            scheduleReconnect();
+            return;
+        }
         m_reconnectTimer->stop();
         m_reconnectAttempts = 0;
         setConnected(true);
         setStatusText("Connected");
-        m_yieldTimer->start();
         fprintf(stderr, "[GUI] Connected to broker at " MQTT_BROKER "\n");
         emitLog("Connected to broker.", "success");
         refreshGuests();
@@ -289,7 +338,6 @@ void MqttClient::connectToBroker()
 
 void MqttClient::disconnectFromBroker()
 {
-    m_yieldTimer->stop();
     m_reconnectTimer->stop();
     m_reconnectAttempts = 0;
     teardownClient();
@@ -333,8 +381,21 @@ void MqttClient::publishCommand(const QString &cmd)
     }
     QByteArray utf8 = cmd.toUtf8();
     fprintf(stderr, "[GUI] >> %s : %s\n", CMD_TOPIC, cmd.toUtf8().constData());
-    MQTTClient_publish(m_client, CMD_TOPIC, utf8.size(), utf8.constData(),
-                       HMS_MQTT_QOS, false, nullptr);
+
+    /* Checked. A dropped publish is indistinguishable from HMS ignoring us:
+       the command never leaves, the timeout below fires, and onCmdTimeout()
+       then blames HMS for still starting up. MQTTCLIENT_MAX_MESSAGES_INFLIGHT
+       is a documented return here at QoS 2, so this is not hypothetical. */
+    int rc = MQTTClient_publish(m_client, CMD_TOPIC, utf8.size(), utf8.constData(),
+                                HMS_MQTT_QOS, false, nullptr);
+    if (rc != MQTTCLIENT_SUCCESS) {
+        fprintf(stderr, "[GUI] publish of '%s' failed: %d\n",
+                cmd.toUtf8().constData(), rc);
+        emitLog(QString("Could not send '%1' — broker returned %2.")
+                    .arg(cmd.section(' ', 0, 0)).arg(rc), "error");
+        return;
+    }
+
     m_pendingCmd = cmd;
     m_cmdTimer->start(m_timeoutSec * 1000);
 #else
