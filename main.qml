@@ -646,6 +646,40 @@ ApplicationWindow {
                     target: mqtt
                     function onHeartbeat() { beatPulse.restart() }
                 }
+
+    /* Scripted control (OTA_GUI_CONTROL=<port>). Deliberately drives the same
+       entry points a click does -- app.currentPage, monitorPage.setGuest(),
+       refreshNow() -- so a scripted run exercises the real paths rather than a
+       parallel set that could drift away from them.
+       Placed after the mqtt Connections block, not inside it: dropping a
+       Connections in the middle of another silently re-parents every handler
+       below the insertion point onto the wrong target. */
+    Connections {
+        target: control
+        function onCommand(verb, arg) {
+            mqtt.diag("control", verb + " " + arg)
+            if (verb === "page") {
+                app.currentPage = parseInt(arg)
+            } else if (verb === "guest") {
+                if (arg === "host" || arg === "") {
+                    monitorPage.setGuest("", "", "", false)
+                } else {
+                    for (var i = 0; i < guestsModel.count; ++i) {
+                        var g = guestsModel.get(i)
+                        if (g.id === arg) {
+                            monitorPage.setGuest(g.id, g.name, g.ip, g.running)
+                            break
+                        }
+                    }
+                }
+            } else if (verb === "refresh") {
+                monitorPage.refreshNow()
+            } else if (verb === "cmd") {
+                mqtt.publishCommand(arg)
+            }
+        }
+    }
+
             }
 
             ToolButton {

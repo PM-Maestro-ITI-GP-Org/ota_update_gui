@@ -5,6 +5,7 @@
 #include <QIcon>
 #include <cstdio>
 #include "mqttclient.h"
+#include "control.h"
 
 int main(int argc, char *argv[])
 {
@@ -29,7 +30,12 @@ int main(int argc, char *argv[])
        Qt requires to match this registration. */
     qmlRegisterSingletonType(QUrl("qrc:/Theme.qml"), "App", 1, 0, "Theme");
 
+    /* Scripted control, off unless OTA_GUI_CONTROL names a port. See
+       control.h -- every bug in this app so far has been a sequence bug, and
+       those are minutes to reproduce by hand and seconds to script. */
+    Control control;
     QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty("control", &control);
 
     /*
      * A QML error used to leave the process running with no window and no

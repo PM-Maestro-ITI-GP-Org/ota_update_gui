@@ -49,6 +49,7 @@ add_executable(ota_gui
     main.cpp
     mqttclient.h
     mqttclient.cpp
+    control.cpp
     ${APP_QML_FILES}
 )
 
