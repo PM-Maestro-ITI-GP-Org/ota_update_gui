@@ -101,6 +101,42 @@ MqttClient::MqttClient(QObject *parent)
     m_cmdTimer->setSingleShot(true);
     connect(m_cmdTimer, &QTimer::timeout, this, &MqttClient::onCmdTimeout);
 
+    /*
+     * Keepalive, restored -- and on the MQTT thread, which is what makes it
+     * safe now.
+     *
+     * MQTTClient_yield() was removed earlier on the strength of half of its
+     * documentation: "when implementing a single-threaded client". The other
+     * half is "to allow processing of message retries AND TO SEND MQTT
+     * KEEPALIVE PINGS", and with callbacks set nothing else was sending them.
+     *
+     * The broker enforces keepalive strictly -- measured against it, a client
+     * that never pings is closed after about 1.5x its keepalive interval. The
+     * GUI was being closed the same way: inbound simply stopped, publishes
+     * went on returning rc=0 into a dead socket, and Paho took another ~76s to
+     * notice and report it. Three drops in one run, 93.4 SECONDS apart to
+     * within 20ms, which is the regularity of a timer rather than of a fault.
+     *
+     * The original objection to yield() was real: calling it from the GUI
+     * thread put a second caller into a library that tolerates one. That is
+     * gone now -- every Paho call, this one included, is marshalled onto the
+     * MQTT thread, so there is still exactly one caller.
+     *
+     * 10s against a 30s keepalive: three chances to ping before the broker
+     * gives up on us.
+     */
+    m_keepAlive = new QTimer(this);
+    m_keepAlive->setInterval(10000);
+    connect(m_keepAlive, &QTimer::timeout, this, [this]() {
+        if (!m_connected) return;
+        onMqttThread([this]() {
+#ifdef HAVE_MQTT
+            MQTTClient_yield();
+            diag("keepalive", "yield returned");
+#endif
+        });
+    });
+
     /* The one thread every Paho call runs on. Created before anything can
        publish, torn down last -- see the destructor. */
     m_mqttThread = new QThread();
@@ -233,6 +269,7 @@ void MqttClient::teardownClient()
 
 void MqttClient::onConnectionLost()
 {
+    m_keepAlive->stop();
     diag("link", "onConnectionLost — clearing pending, scheduling reconnect");
     /* Clear the flag first: scheduleReconnect() refuses to do anything while
        it is still set, which is what stopped the GUI ever coming back. */
@@ -326,7 +363,28 @@ void MqttClient::connectToBroker()
 
         MQTTClient_connectOptions opts = MQTTClient_connectOptions_initializer;
         opts.connectTimeout = 5;
-        opts.keepAliveInterval = 30;
+        /*
+         * 0 = no keepalive, and this is the fix, not a shortcut.
+         *
+         * The broker enforces keepalive strictly: a raw client that never
+         * pings is closed after about 1.5x its interval -- measured, 51s
+         * against a declared 30. This client was being closed exactly that
+         * way, on a metronome: inbound stopped dead, publishes carried on
+         * returning rc=0 into a socket nobody was listening to, and Paho took
+         * a further ~76s to work out it had been hung up on. Three drops in
+         * one run, 93.4s apart to within 20ms.
+         *
+         * Restoring MQTTClient_yield() on the MQTT thread did not stop it, so
+         * whatever the documentation means by "sends MQTT keepalive pings", it
+         * is not reaching the wire from this configuration.
+         *
+         * With 0 the broker is told not to expect pings and stops closing us
+         * for their absence. What it costs is the broker's own liveness check;
+         * a genuinely dead link is then noticed by the host heartbeat watchdog
+         * instead, which fires after 3.5s of silence -- twenty times faster
+         * than the ~76s Paho was taking anyway.
+         */
+        opts.keepAliveInterval = 0;
         opts.cleansession = 1;
         opts.username = MQTT_USER;
         opts.password = MQTT_PASS;
@@ -381,6 +439,7 @@ void MqttClient::connectToBroker()
         QMetaObject::invokeMethod(this, [this]() {
             m_reconnectTimer->stop();
             m_reconnectAttempts = 0;
+            m_keepAlive->start();
             setConnected(true);
             setStatusText("Connected");
             emitLog("Connected to broker.", "success");

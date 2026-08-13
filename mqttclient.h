@@ -196,6 +196,7 @@ private:
     QObject *m_mqttWorker = nullptr;
     void onMqttThread(std::function<void()> fn);
 
+    QTimer *m_keepAlive = nullptr;
     QTimer *m_cmdTimer;
     QTimer *m_reconnectTimer;
     int m_reconnectAttempts = 0;
