@@ -150,8 +150,19 @@ Item {
                             Layout.fillWidth: true
                             from: 0; to: 100
                             value: app.progressPercent
-                            indeterminate: app.otaBusy && app.progressPercent <= 0
-                            Material.accent: app.chkApplied ? Theme.success : Theme.primary
+                            /* partitionBusy, not otaBusy: otaBusy also
+                               includes pushingNow (it is the shared button
+                               lock across all three flows), which made this
+                               bar animate for a Send-to-guest push that
+                               never touches progressPercent -- it has its
+                               own bar/tracker below. */
+                            indeterminate: app.partitionBusy && app.progressPercent <= 0
+                            /* Green once the Replace -> Apply/fetch flow's
+                               last step finished successfully -- not only
+                               when chkApplied is set, since a fetch that
+                               still has more files queued finishes too, just
+                               not with Apply itself. */
+                            Material.accent: (!app.partitionBusy && app.lastOtaSucceeded) ? Theme.success : Theme.primary
                         }
 
                         RowLayout {
@@ -164,7 +175,7 @@ Item {
                                 wrapMode: Text.Wrap
                             }
                             Text {
-                                text: app.otaBusy ? Math.round(app.progressPercent) + "%" : ""
+                                text: app.partitionBusy ? Math.round(app.progressPercent) + "%" : ""
                                 color: Theme.primary
                                 font.pixelSize: Theme.fontSmall
                                 font.weight: Font.DemiBold
@@ -429,6 +440,30 @@ Item {
                             onClicked: app.pickSendFile()
                         }
 
+                        Button {
+                            text: "Save…"
+                            flat: true
+                            implicitHeight: Theme.controlHeight
+                            font.pixelSize: Theme.fontBody
+                            enabled: !app.otaBusy && sendModel.count > 0
+                            Material.foreground: Theme.primary
+                            ToolTip.visible: hovered
+                            ToolTip.text: "Save this list of files and destinations to reload later"
+                            onClicked: savePresetDialog.open()
+                        }
+
+                        Button {
+                            text: "Load…"
+                            flat: true
+                            implicitHeight: Theme.controlHeight
+                            font.pixelSize: Theme.fontBody
+                            enabled: !app.otaBusy && app.sendPresetNames().length > 0
+                            Material.foreground: Theme.primary
+                            ToolTip.visible: hovered
+                            ToolTip.text: "Load a previously saved list of files and destinations"
+                            onClicked: loadPresetDialog.open()
+                        }
+
                         FilledButton {
                             text: app.pushingNow ? "Sending…" : "Send to guest"
                             implicitHeight: Theme.controlHeight
@@ -439,6 +474,82 @@ Item {
                             accent: Theme.success
                             onClicked: app.sendFilesToGuest()
                         }
+                    }
+
+                    /* Its own three-step stepper, same visual pattern as the
+                       Replace -> Apply one above but naming this flow's real
+                       steps: pack + upload to the server, the host pulling
+                       it back down, then delivering it into the guest.
+                       Entirely separate state (pushUploaded/pushPulled/
+                       pushDelivered, pushProgressPercent) -- see the
+                       properties' own comments in main.qml for why reusing
+                       the Replace -> Apply flags broke the Apply button. */
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 0
+                        visible: app.pushingNow || app.pushUploaded || app.pushStatus !== ""
+
+                        Repeater {
+                            model: [
+                                { n: 1, label: "Upload to server",
+                                  done: app.pushUploaded,
+                                  active: app.pushingNow && !app.pushUploaded },
+                                { n: 2, label: "Pull to host",
+                                  done: app.pushPulled,
+                                  active: app.pushingNow && app.pushUploaded && !app.pushPulled },
+                                { n: 3, label: "Send to guest",
+                                  done: app.pushDelivered,
+                                  active: app.pushingNow && app.pushPulled && !app.pushDelivered }
+                            ]
+
+                            delegate: RowLayout {
+                                Layout.fillWidth: true
+                                spacing: Theme.spacingTight
+
+                                Rectangle {
+                                    implicitWidth: 34; implicitHeight: 34
+                                    radius: 17
+                                    color: modelData.done ? Theme.success
+                                         : modelData.active ? Theme.primary : Theme.surfaceVariant
+                                    border.color: modelData.done || modelData.active
+                                        ? "transparent" : Theme.outline
+                                    border.width: 1
+
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: modelData.done ? "✓" : String(modelData.n)
+                                        color: modelData.done || modelData.active
+                                            ? Theme.textOnAccent : Theme.textSecondary
+                                        font.pixelSize: Theme.fontBody
+                                        font.weight: Font.Bold
+                                    }
+                                }
+
+                                Text {
+                                    text: modelData.label
+                                    color: modelData.done || modelData.active
+                                        ? Theme.textPrimary : Theme.textSecondary
+                                    font.pixelSize: Theme.fontBody
+                                    font.weight: modelData.active ? Font.DemiBold : Font.Normal
+                                }
+
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    Layout.preferredHeight: 2
+                                    visible: modelData.n < 3
+                                    color: modelData.done ? Theme.success : Theme.outline
+                                }
+                            }
+                        }
+                    }
+
+                    ProgressBar {
+                        Layout.fillWidth: true
+                        visible: app.pushingNow || app.pushUploaded || app.pushStatus !== ""
+                        from: 0; to: 100
+                        value: app.pushProgressPercent
+                        indeterminate: app.pushingNow && app.pushProgressPercent <= 0
+                        Material.accent: (!app.pushingNow && app.pushDelivered) ? Theme.success : Theme.primary
                     }
 
                     Text {
@@ -551,6 +662,130 @@ Item {
             color: Theme.textPrimary
             font.pixelSize: Theme.fontBody
             wrapMode: Text.Wrap
+        }
+    }
+
+    /* ---- save the current Send-files list as a named preset ---- */
+    Dialog {
+        id: savePresetDialog
+        anchors.centerIn: Overlay.overlay
+        width: 420
+        modal: true
+        title: "Save file list"
+        standardButtons: Dialog.Cancel | Dialog.Ok
+        Material.background: Theme.surface
+
+        onOpened: { nameField.text = ""; nameField.forceActiveFocus() }
+        onAccepted: app.saveSendPreset(nameField.text)
+
+        ColumnLayout {
+            width: parent.width
+            spacing: Theme.spacingTight
+
+            Text {
+                Layout.fillWidth: true
+                text: "Save the current " + sendModel.count +
+                      " file(s) and their destinations under a name, to load again later."
+                color: Theme.textSecondary
+                font.pixelSize: Theme.fontSmall
+                wrapMode: Text.Wrap
+            }
+
+            TextField {
+                id: nameField
+                Layout.fillWidth: true
+                Layout.preferredHeight: 42
+                placeholderText: "e.g. \"motor firmware set\""
+                font.pixelSize: Theme.fontBody
+                Material.accent: Theme.primary
+                onAccepted: savePresetDialog.accept()
+            }
+        }
+    }
+
+    /* ---- load (or delete) a previously saved preset ---- */
+    Dialog {
+        id: loadPresetDialog
+        anchors.centerIn: Overlay.overlay
+        width: 460
+        height: 420
+        modal: true
+        title: "Load a saved file list"
+        standardButtons: Dialog.Cancel
+        Material.background: Theme.surface
+
+        property var names: []
+        onOpened: names = app.sendPresetNames()
+
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: Theme.spacingTight
+
+            Text {
+                Layout.fillWidth: true
+                visible: loadPresetDialog.names.length === 0
+                text: "No saved file lists yet — use Save next to Add file."
+                color: Theme.textDisabled
+                font.pixelSize: Theme.fontBody
+                wrapMode: Text.Wrap
+            }
+
+            ListView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                visible: loadPresetDialog.names.length > 0
+                model: loadPresetDialog.names
+                spacing: 6
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                delegate: Rectangle {
+                    width: ListView.view.width
+                    height: 46
+                    radius: Theme.radiusSmall
+                    color: Theme.surfaceSunken
+                    border.color: Theme.outline
+                    border.width: 1
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: Theme.spacingTight
+                        anchors.rightMargin: Theme.spacingTight
+                        spacing: Theme.spacingTight
+
+                        Text {
+                            text: modelData
+                            color: Theme.textPrimary
+                            font.pixelSize: Theme.fontBody
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                        }
+
+                        Button {
+                            text: "Load"
+                            flat: true
+                            implicitHeight: 34
+                            font.pixelSize: Theme.fontSmall
+                            Material.foreground: Theme.primary
+                            onClicked: {
+                                app.loadSendPreset(modelData);
+                                loadPresetDialog.close();
+                            }
+                        }
+
+                        ToolButton {
+                            text: "✕"
+                            font.pixelSize: Theme.fontBody
+                            Material.foreground: Theme.danger
+                            onClicked: {
+                                app.deleteSendPreset(modelData);
+                                loadPresetDialog.names = app.sendPresetNames();
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
