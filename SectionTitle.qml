@@ -1,6 +1,6 @@
 import QtQuick
 import QtQuick.Layouts
-import App 1.0
+import PdM.Core
 
 /* Heading + optional one-line explanation, used at the top of every panel. */
 ColumnLayout {

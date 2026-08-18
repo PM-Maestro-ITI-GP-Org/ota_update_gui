@@ -1,6 +1,25 @@
+#include <QQmlEngine>
 #include "control.h"
 #include <QCoreApplication>
 #include <cstdio>
+
+namespace PdM {
+namespace Ota {
+
+Control *Control::instance()
+{
+    static Control control;
+    return &control;
+}
+
+Control *Control::create(QQmlEngine *, QJSEngine *)
+{
+    Control *control = instance();
+    /* The engine would otherwise take ownership of an object it did not
+       allocate and destroy it at teardown. */
+    QJSEngine::setObjectOwnership(control, QJSEngine::CppOwnership);
+    return control;
+}
 
 Control::Control(QObject *parent) : QObject(parent)
 {
@@ -61,3 +80,6 @@ void Control::onConnection()
     });
     connect(sock, &QTcpSocket::disconnected, sock, &QObject::deleteLater);
 }
+
+} // namespace Ota
+} // namespace PdM

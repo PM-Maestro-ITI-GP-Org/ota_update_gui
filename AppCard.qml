@@ -1,5 +1,5 @@
 import QtQuick
-import App 1.0
+import PdM.Core
 
 /*
  * A Material surface: rounded, hairline-outlined, with a soft elevation edge.

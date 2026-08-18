@@ -1,6 +1,8 @@
 #ifndef CONTROL_H
 #define CONTROL_H
 
+#include <QtQml/qqmlregistration.h>
+#include <QQmlEngine>
 #include <QObject>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -28,11 +30,32 @@
  *     state               dump the current UI state as JSON
  *     quit                exit the application
  */
+namespace PdM {
+namespace Ota {
+
 class Control : public QObject
 {
     Q_OBJECT
+    /*
+     * A singleton of the PdM.Ota module, where it used to be a context property
+     * named `control` set on the engine's root context from main.cpp.
+     *
+     * Two reasons it had to change. Maestro never compiles this repo's
+     * main.cpp, so the context property would simply never be set and QML would
+     * fail on an undefined name. And the root context is shared by the whole
+     * process: a second app wanting its own `control` would silently overwrite
+     * this one, with no diagnostic anywhere.
+     *
+     * Still inert unless OTA_GUI_CONTROL names a port -- the constructor starts
+     * no server without it -- so nothing listens inside Maestro by accident.
+     */
+    QML_ELEMENT
+    QML_SINGLETON
 public:
     explicit Control(QObject *parent = nullptr);
+
+    static Control *instance();
+    static Control *create(QQmlEngine *, QJSEngine *);
 
     /* True when OTA_GUI_CONTROL was set and the port is listening. */
     bool active() const { return m_server != nullptr; }
@@ -52,5 +75,9 @@ private:
     QTcpServer *m_server = nullptr;
     QString     m_state = "{}";
 };
+
+
+} // namespace Ota
+} // namespace PdM
 
 #endif

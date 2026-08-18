@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
-import App 1.0
+import PdM.Core
 
 /*
  * The guest list on the hypervisor host.

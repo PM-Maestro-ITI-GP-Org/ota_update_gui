@@ -4,31 +4,31 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 import Qt.labs.folderlistmodel
-import MqttClient 1.0
-import App 1.0
+import PdM.Core
 
 /*
- * Shell for the whole app: window chrome, navigation, the shared models, and
- * the MQTT wiring. The five screens live in their own files.
+ * The OTA updater, as a page: navigation, the shared models, and the MQTT
+ * wiring. The five screens live in their own files.
  *
- * The previous single 1841-line main.qml carried the layout, the state machine
- * and the GitHub-dark palette inline for all of it, which is why the pages had
- * drifted apart visually and why the OTA tab could not be changed without
- * touching everything else.
+ * A Page and not an ApplicationWindow, because in Maestro this lives inside a
+ * tab and a tab cannot contain a window. Page was the right shape to land on:
+ * it is an Item, so it drops into the tab stack, and it keeps `header`, which
+ * the ToolBar below needs and a plain Item does not have. The window that used
+ * to be here is now Main.qml, which exists only for the standalone build.
+ *
+ * `id: app` is kept -- fifteen bindings refer to it, all of them naming
+ * properties declared here rather than window API.
+ *
+ * MqttClient and Control need no import: they are registered into this file's
+ * own module, PdM.Ota, by QML_ELEMENT in their headers.
  */
-ApplicationWindow {
+Page {
     id: app
 
-    /* Roomier by default: the old 1150x680 left the guest table and the OTA
-       cards fighting for the same few hundred pixels. */
-    width: 1440
-    height: 920
-    minimumWidth: 1080
-    minimumHeight: 700
-    visible: true
-    title: "Hypervisor Management — OTA Update"
-
-    color: Theme.background
+    /* Page has no `color`; the equivalent is a background item. It also makes
+       the page opaque wherever it is placed, rather than inheriting whatever is
+       behind it in the tab stack. */
+    background: Rectangle { color: Theme.background }
 
     Material.theme: Theme.dark ? Material.Dark : Material.Light
     Material.primary: Theme.primary
@@ -655,7 +655,7 @@ ApplicationWindow {
        Connections in the middle of another silently re-parents every handler
        below the insertion point onto the wrong target. */
     Connections {
-        target: control
+        target: Control
         function onCommand(verb, arg) {
             mqtt.diag("control", verb + " " + arg)
             if (verb === "page") {
@@ -852,8 +852,14 @@ ApplicationWindow {
                    `top` plus an SSH on the host and a few hundred lines of
                    parsing here, and none of that is worth doing for a window
                    the user has minimised. */
+                /* Two ways for this page to be off-screen now. The
+                   attached Window.visibility reports whichever window the page
+                   ends up in -- its own when standalone, Maestro's when in a
+                   tab -- and app.visible covers the tab simply not being the
+                   one on display, which minimisation alone would miss. */
                 active: app.currentPage === 3 && mqtt.connected
-                        && app.visibility !== Window.Minimized
+                        && app.visible
+                        && Window.visibility !== Window.Minimized
                 onRequestStats: (id) => mqtt.guestStats(id)
             }
 

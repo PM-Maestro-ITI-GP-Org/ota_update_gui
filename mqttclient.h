@@ -1,6 +1,7 @@
 #ifndef OTA_GUI_MQTTCLIENT_H
 #define OTA_GUI_MQTTCLIENT_H
 
+#include <QtQml/qqmlregistration.h>
 #include <QObject>
 #include <QString>
 #include <QTimer>
@@ -16,9 +17,27 @@
 #include <MQTTClient.h>
 #endif
 
+/*
+ * Namespaced because ota_update_gui and motor_recorder_gui both define a class
+ * called MqttClient, and in Maestro both are linked into one binary. Left in
+ * the global namespace they collide at link time -- "multiple definition of
+ * MqttClient::publishCommand" -- which is a link error rather than anything
+ * subtle, but only appears once two apps are integrated, so it is worth
+ * knowing before the third arrives.
+ */
+namespace PdM {
+namespace Ota {
+
 class MqttClient : public QObject
 {
     Q_OBJECT
+    /* Registered into the PdM.Ota QML module by name, replacing the
+       qmlRegisterType() call that used to sit in main.cpp. It has to be a
+       declaration rather than a call because Maestro never compiles this repo's
+       main.cpp -- a registration made there would simply not happen in the
+       merged build, and the type would be missing from QML with a clean
+       compile. */
+    QML_ELEMENT
     Q_PROPERTY(bool connected READ isConnected NOTIFY connectedChanged)
 
     /* Whether the BOARD is alive -- which is a different question from
@@ -203,5 +222,9 @@ private:
     QString m_pendingCmd;
     int m_timeoutSec = 15;
 };
+
+
+} // namespace Ota
+} // namespace PdM
 
 #endif

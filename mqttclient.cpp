@@ -14,6 +14,18 @@
 #define MQTT_USER "mqttuser"
 #define MQTT_PASS "123456"
 
+/*
+ * Namespaced because ota_update_gui and motor_recorder_gui both define a class
+ * called MqttClient, and in Maestro both are linked into one binary. Left in
+ * the global namespace they collide at link time -- "multiple definition of
+ * MqttClient::publishCommand" -- which is a link error rather than anything
+ * subtle, but only appears once two apps are integrated, so it is worth
+ * knowing before the third arrives.
+ */
+namespace PdM {
+namespace Ota {
+
+
 /* Exactly-once, matching HMS_MQTT_QOS in the host's mqtt_client.h. QoS 2 is a
  * four-part handshake per message, so on a ~145ms link each publish costs
  * about half a second of round trips -- paid for no duplicated commands and
@@ -1419,3 +1431,6 @@ void MqttClient::downloadFromServer(const QString &remotePath, const QString &lo
     };
     dl->sizeProc->start("ssh", sizeArgs);
 }
+
+} // namespace Ota
+} // namespace PdM

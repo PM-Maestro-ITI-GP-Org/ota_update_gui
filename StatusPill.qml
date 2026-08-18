@@ -1,5 +1,5 @@
 import QtQuick
-import App 1.0
+import PdM.Core
 
 /*
  * A small state chip: running / stopped, a file's step, a connection state.

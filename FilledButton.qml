@@ -1,6 +1,6 @@
 import QtQuick
 import QtQuick.Controls
-import App 1.0
+import PdM.Core
 
 /*
  * A filled action button with an explicit background.

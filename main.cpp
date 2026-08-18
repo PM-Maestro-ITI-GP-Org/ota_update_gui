@@ -1,17 +1,37 @@
 #include <QApplication>
 #include <QQmlApplicationEngine>
-#include <QQmlContext>
 #include <QQuickStyle>
-#include <QIcon>
+#include <QtQml/qqmlextensionplugin.h>
 #include <cstdio>
-#include "mqttclient.h"
-#include "control.h"
+
+/*
+ * The standalone entry point, and only that.
+ *
+ * Maestro does not compile this file -- see PROJECT_IS_TOP_LEVEL in
+ * CMakeLists.txt -- so nothing here may be load-bearing for the app itself.
+ * Everything that used to live here and matters to both builds has moved: the
+ * qmlRegisterType() call is now QML_ELEMENT in mqttclient.h, the Theme
+ * singleton comes from PdM.Core, and the `control` context property is a
+ * QML_SINGLETON in control.h. That last one had to change: a context property
+ * set here would never be set in the merged build, and the engine's root
+ * context is shared by every app in the process.
+ */
+
+/* Static QML modules need an explicit import from the executable that links
+   them. Without these the types resolve at build time and are missing at run
+   time, which presents as "OtaAppPage is not a type" from a file that plainly
+   imports the module. */
+Q_IMPORT_QML_PLUGIN(PdM_CorePlugin)
+Q_IMPORT_QML_PLUGIN(PdM_OtaPlugin)
 
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
+
+    /* Shared with Maestro on purpose, so a broker set in one is the broker the
+       other uses -- PdM.Core's BrokerSettings persists it through QSettings. */
+    app.setOrganizationName("PM-Maestro-ITI-GP-Org");
     app.setApplicationName("OTA Update GUI");
-    app.setOrganizationName("PM-Maestro");
 
     /*
      * Material, and set here rather than in the QML.
@@ -19,23 +39,11 @@ int main(int argc, char *argv[])
      * QtQuick.Controls.Material's attached properties only theme controls that
      * the Material style actually instantiated, so the style has to be chosen
      * before the engine loads anything. The light/dark palette itself is
-     * decided in Theme.qml and applied to the root window.
+     * decided in PdM.Core's Theme and applied to the root window.
      */
     QQuickStyle::setStyle("Material");
 
-    qmlRegisterType<MqttClient>("MqttClient", 1, 0, "MqttClient");
-
-    /* Theme.qml as a singleton, so every page reads one palette instead of
-       repeating hex literals. Theme.qml also carries `pragma Singleton`, which
-       Qt requires to match this registration. */
-    qmlRegisterSingletonType(QUrl("qrc:/Theme.qml"), "App", 1, 0, "Theme");
-
-    /* Scripted control, off unless OTA_GUI_CONTROL names a port. See
-       control.h -- every bug in this app so far has been a sequence bug, and
-       those are minutes to reproduce by hand and seconds to script. */
-    Control control;
     QQmlApplicationEngine engine;
-    engine.rootContext()->setContextProperty("control", &control);
 
     /*
      * A QML error used to leave the process running with no window and no
@@ -45,15 +53,11 @@ int main(int argc, char *argv[])
      */
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed,
                      &app, []() {
-        fprintf(stderr, "[GUI] FATAL: main.qml failed to load — see the QML errors above.\n");
+        fprintf(stderr, "[GUI] FATAL: Main.qml failed to load — see the QML errors above.\n");
         QCoreApplication::exit(1);
     }, Qt::QueuedConnection);
 
-    engine.load(QUrl("qrc:/main.qml"));
-    if (engine.rootObjects().isEmpty()) {
-        fprintf(stderr, "[GUI] FATAL: no root object was created from main.qml.\n");
-        return 1;
-    }
+    engine.loadFromModule("OtaGuiApp", "Main");
 
     return app.exec();
 }
