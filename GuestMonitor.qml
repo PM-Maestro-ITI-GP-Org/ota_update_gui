@@ -56,6 +56,12 @@ Item {
     property string lastUpdated: ""
     property string statusText: ""
 
+    /* Which cards the user wants to see. Host is a single toggle; each guest
+       carries its own "selected" role on its guestCards row (set true when
+       the row is created in syncCards(), so a guest that only just started
+       is shown by default rather than hidden until the user opts it in). */
+    property bool hostSelected: true
+
     /* Targets ("" for host, a guest id otherwise) currently awaiting a
        reply. A plain map for membership tests in JS; inFlightCount is the
        property bindings actually watch, since mutating a `var` map in place
@@ -140,7 +146,7 @@ Item {
                     statsRunning: false, error: "",
                     hostname: "", loadText: "—", cpusText: "—",
                     ramUsedBytes: 0, ramTotalBytes: 0, kernel: "",
-                    lastUpdated: ""
+                    lastUpdated: "", selected: true
                 })
             } else {
                 if (guestCards.get(idx).name !== (g.name || ""))
@@ -280,8 +286,21 @@ Item {
         property string label: ""
         property string value: ""
         property int minWidth: 170
+        /* 0 = uncapped (unchanged for every other Stat use). KERNEL sets this:
+           its value is a full `uname -a` line, and a Linux guest's is much
+           longer than a QNX one's -- Text.implicitWidth reflects the FULL
+           unwrapped string regardless of the elide set on valueText below
+           (elide only trims what is actually painted, not the reported
+           implicit size), so without a cap this tile alone could balloon to
+           4-5x a QNX card's width. That widened the Flow's row (or pushed it
+           onto an extra row) only for whichever guest had the longer kernel
+           string, which ate into that specific card's fixed-height ProcTable
+           below it and made it visibly shorter than the other cards'. */
+        property int maxWidth: 0
 
-        implicitWidth: Math.max(minWidth, valueText.implicitWidth + 28)
+        implicitWidth: maxWidth > 0
+            ? Math.max(minWidth, Math.min(valueText.implicitWidth + 28, maxWidth))
+            : Math.max(minWidth, valueText.implicitWidth + 28)
         implicitHeight: 74
         radius: Theme.radiusSmall
         color: Theme.surfaceSunken
@@ -508,6 +527,42 @@ Item {
             }
         }
 
+        /* Which cards to show. All on by default -- unchecking one just hides
+           its card below, it does not stop polling it (unselecting the
+           hypervisor host while still watching a guest would otherwise have
+           to keep the host request in flight anyway, since it always answers
+           in the same round). */
+        Flow {
+            Layout.fillWidth: true
+            spacing: Theme.spacingTight
+
+            CheckBox {
+                text: "Hypervisor host"
+                checked: root.hostSelected
+                font.pixelSize: Theme.fontSmall
+                Material.foreground: Theme.textPrimary
+                Material.accent: Theme.primary
+                onToggled: root.hostSelected = checked
+            }
+
+            Repeater {
+                model: guestCards
+                delegate: CheckBox {
+                    required property int index
+                    required property string gid
+                    required property string name
+                    required property bool selected
+
+                    text: "Guest — " + gid + (name !== "" && name !== "-" ? " · " + name : "")
+                    checked: selected
+                    font.pixelSize: Theme.fontSmall
+                    Material.foreground: Theme.textPrimary
+                    Material.accent: Theme.primary
+                    onToggled: guestCards.setProperty(index, "selected", checked)
+                }
+            }
+        }
+
         ScrollView {
             Layout.fillWidth: true
             Layout.fillHeight: true
@@ -518,10 +573,11 @@ Item {
                 width: root.width
                 spacing: Theme.spacing
 
-                /* ---- host: always shown ---- */
+                /* ---- host: shown whenever selected ---- */
                 AppCard {
                     Layout.fillWidth: true
                     Layout.preferredHeight: 400
+                    visible: root.hostSelected
 
                     ColumnLayout {
                         anchors.fill: parent
@@ -559,6 +615,7 @@ Item {
                             Stat {
                                 label: "KERNEL"
                                 minWidth: 320
+                                maxWidth: 420
                                 value: root.hostSummary ? (root.hostSummary.kernel || "—") : "—"
                             }
                         }
@@ -588,9 +645,16 @@ Item {
                         required property real ramUsedBytes
                         required property real ramTotalBytes
                         required property string kernel
+                        required property bool selected
 
                         Layout.fillWidth: true
-                        Layout.preferredHeight: statsRunning ? 400 : 140
+                        /* Fixed at 400 regardless of statsRunning, matching the
+                           hypervisor host card and every other guest card --
+                           the old "140 while waiting for the first reply"
+                           made the row heights jump around, and made a guest
+                           still booting look like a smaller, lesser card. */
+                        Layout.preferredHeight: 400
+                        visible: selected
 
                         ColumnLayout {
                             anchors.fill: parent
@@ -651,7 +715,7 @@ Item {
                                 Stat { label: "LOAD";     value: loadText }
                                 Stat { label: "CPUS";     value: cpusText }
                                 RamStat { usedBytes: ramUsedBytes; totalBytes: ramTotalBytes }
-                                Stat { label: "KERNEL"; minWidth: 320; value: kernel || "—" }
+                                Stat { label: "KERNEL"; minWidth: 320; maxWidth: 420; value: kernel || "—" }
                             }
 
                             ProcTable {
