@@ -4,6 +4,7 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 import Qt.labs.folderlistmodel
+import QtCore
 import MqttClient 1.0
 import App 1.0
 
@@ -51,6 +52,81 @@ ApplicationWindow {
     ListModel { id: sendModel }          /* local, dest */
     ListModel { id: browseModel }        /* name, isDir, size */
 
+    /* Where the local file picker and the guest filesystem browser last
+       left off, persisted across app restarts (not just within a run) --
+       both used to always reopen at their starting point (home directory,
+       guest root) no matter where the last pick happened, which meant
+       re-selecting a file or destination deep in a tree every single time. */
+    Settings {
+        id: uiSettings
+        category: "browse"
+        property string lastLocalFolder: ""
+        property string lastGuestPath: "/"
+    }
+
+    /* Named sets of (local file, guest destination) pairs for the "Send
+       files" list, persisted across restarts the same way as uiSettings
+       above. Settings only stores plain values, not arrays of objects, so
+       the whole preset map is kept as one JSON string and (de)serialized on
+       each save/load rather than as a second, separately-synced copy that
+       could drift from what is actually on disk. */
+    Settings {
+        id: presetSettings
+        category: "sendPresets"
+        property string presetsJson: "{}"
+    }
+
+    function loadSendPresets() {
+        try {
+            var obj = JSON.parse(presetSettings.presetsJson);
+            return obj && typeof obj === "object" ? obj : {};
+        } catch (e) {
+            return {};
+        }
+    }
+
+    function sendPresetNames() {
+        var names = Object.keys(loadSendPresets());
+        names.sort();
+        return names;
+    }
+
+    /* Saves the CURRENT sendModel (local paths and their guest destinations)
+       under `name`, overwriting any preset already saved under it. Only the
+       paths are kept, not the files themselves -- if a local file has since
+       moved or been deleted, loading the preset back will queue a path that
+       no longer resolves, the same as re-typing a stale path by hand would. */
+    function saveSendPreset(name) {
+        name = name.trim();
+        if (name === "" || sendModel.count === 0) return;
+        var presets = loadSendPresets();
+        var entries = [];
+        for (var i = 0; i < sendModel.count; ++i) {
+            var r = sendModel.get(i);
+            entries.push({ local: r.local, dest: r.dest });
+        }
+        presets[name] = entries;
+        presetSettings.presetsJson = JSON.stringify(presets);
+        log("info", "Saved " + entries.length + " file(s) as \"" + name + "\".");
+    }
+
+    /* Replaces sendModel's current contents with the saved preset's. */
+    function loadSendPreset(name) {
+        var presets = loadSendPresets();
+        var entries = presets[name];
+        if (!entries) return;
+        sendModel.clear();
+        for (var i = 0; i < entries.length; ++i)
+            sendModel.append({ local: entries[i].local, dest: entries[i].dest });
+        log("info", "Loaded " + entries.length + " file(s) from \"" + name + "\".");
+    }
+
+    function deleteSendPreset(name) {
+        var presets = loadSendPresets();
+        delete presets[name];
+        presetSettings.presetsJson = JSON.stringify(presets);
+    }
+
     property int    currentPage: 0
     property bool   guestsLoading: false
     property string lastUpdateText: ""
@@ -64,6 +140,14 @@ ApplicationWindow {
     property bool uploadingNow: false
     property bool pushingNow: false
     readonly property bool otaBusy: otaDeploying || uploadingNow || pushingNow
+    /* otaBusy is the shared button-lock -- it deliberately includes
+       pushingNow too, so Replace/Apply/Send-to-guest can't run concurrently
+       with each other. The Replace -> Apply progress bar and its stepper
+       must NOT use it for their own busy/colour state though: doing so made
+       that bar animate (and its "N%" label appear) for a Send-to-guest push
+       that never touches progressPercent at all, since otaBusy alone was
+       already true. This is the partition-flow-only equivalent. */
+    readonly property bool partitionBusy: otaDeploying || uploadingNow
 
     property string currentGuestType: ""
     property bool   chkUploaded: false
@@ -77,6 +161,15 @@ ApplicationWindow {
     property int    currentStageIdx: -1
     property string otaStageLabel: "Select a guest, then choose replacement files for its partitions."
     property string pushStatus: ""
+    /* Send to guest gets its own three-step tracker and its own progress bar
+       -- entirely separate from chkUploaded/chkDownloaded/chkApplied and
+       progressPercent above, which are Replace -> Apply's. Reusing those
+       previously enabled the "Apply and restart guest" button and lit that
+       flow's step 3 after a plain push, which has nothing to apply. */
+    property bool   pushUploaded: false    /* archive reached the server */
+    property bool   pushPulled: false      /* host pulled it down from the server */
+    property bool   pushDelivered: false   /* extracted into the running guest */
+    property real   pushProgressPercent: 0
 
     property string infoGuestId: ""
     property var    infoFields: []
@@ -86,6 +179,11 @@ ApplicationWindow {
     property string browsePath: "/"
     property string browseSelected: ""
     property bool   lsPending: false
+    /* Persist wherever the guest browser last navigated to, the same as the
+       local file picker (uiSettings.lastLocalFolder) -- it used to always
+       reopen at the guest's root regardless of where a previous browse had
+       gone. */
+    onBrowsePathChanged: uiSettings.lastGuestPath = browsePath
 
     function log(type, text) { logPanel.append(type, text) }
 
@@ -209,10 +307,21 @@ ApplicationWindow {
     }
 
     function doFetch() {
-        var idx = -1;
+        /* Every file not yet downloaded, sent in ONE fetchOtaFiles() call --
+           not one call per file. hms/ota/ota.c's ota_fetch_thread() clears
+           and recreates the guest's whole stage/ directory once at the start
+           of EACH job it runs, on the assumption that a job's n_paths is the
+           complete list wanted this round. That is exactly right for a
+           single batched call; called once per file instead, each file's own
+           job wiped out whatever the previous call had just pulled down, so
+           only the last file fetched ever survived to the stage directory.
+           fetchOtaFiles() already accepts the whole list (it joins them into
+           one "fetch <guest> <path1> <path2> ..." command) -- this was
+           simply never exercised with more than one path at a time. */
+        var idxs = [];
         for (var i = 0; i < stagedModel.count; ++i)
-            if (stagedModel.get(i).sent && !stagedModel.get(i).downloaded) { idx = i; break; }
-        if (idx < 0) {
+            if (stagedModel.get(i).sent && !stagedModel.get(i).downloaded) idxs.push(i);
+        if (idxs.length === 0) {
             if (stagedModel.count > 0 && readyCount() === stagedModel.count) {
                 chkDownloaded = true;
                 uploadingNow = false;
@@ -221,14 +330,16 @@ ApplicationWindow {
             }
             return;
         }
-        currentStageIdx = idx;
-        setRowState(idx, "downloading");
+        var paths = [];
+        for (var j = 0; j < idxs.length; ++j) {
+            setRowState(idxs[j], "downloading");
+            paths.push(stagedModel.get(idxs[j]).serverPath);
+        }
         otaPhase = "fetch";
         otaDeploying = true;
         chkDownloaded = false; chkApplied = false; otaStage = "";
-        var row = stagedModel.get(idx);
-        mqtt.fetchOtaFiles(selectedGuestId, [row.serverPath]);
-        otaStageLabel = "Pulling " + row.destName + " from the server down to the host…";
+        mqtt.fetchOtaFiles(selectedGuestId, paths);
+        otaStageLabel = "Pulling " + paths.length + " file(s) from the server down to the host…";
     }
 
     function doApply() {
@@ -263,6 +374,8 @@ ApplicationWindow {
         if (selectedGuestId === "") { log("error", "Select a guest first."); return; }
 
         pushStatus = "Packing " + sendModel.count + " file(s)…";
+        pushProgressPercent = 0;
+        pushUploaded = false; pushPulled = false; pushDelivered = false;
         pushingNow = true;
         otaPhase = "push";
         var tarPath = mqtt.buildPushTar(sendEntriesList(), "/tmp/pushfiles.tar.gz");
@@ -409,6 +522,23 @@ ApplicationWindow {
         onGuestFilesReceived: (json) => loadPartitions(json)
 
         onUploadProgress: (percent, fileName) => {
+            /* uploadOtaFile() (Replace's own upload) and uploadGenericFile()
+               (Send to guest's tar upload) are two different Q_INVOKABLEs in
+               mqttclient.cpp, but both report through this ONE uploadProgress
+               signal -- there is nothing in the signal itself to say which
+               kind of upload it is. Without this check, a push's archive
+               upload wrote straight into progressPercent/otaStageLabel,
+               which the top (partition) bar reads, printing that flow's
+               file/percent up there even though nothing partition-related
+               was happening. pushingNow is only ever true for the span of a
+               Send-to-guest push (see sendFilesToGuest()), and the two flows
+               are mutually exclusive (both gated on otaBusy), so it reliably
+               tells the two apart. */
+            if (pushingNow) {
+                pushProgressPercent = percent;
+                pushStatus = "Uploading " + fileName + " to the server — " + percent + "%";
+                return;
+            }
             progressPercent = percent;
             otaStage = "upload";
             uploadFileName = fileName;
@@ -416,56 +546,99 @@ ApplicationWindow {
         }
 
         onOtaProgress: (guest, stage, progress, msg) => {
+            /* Send to guest has its own progress bar and three-step tracker
+               (pushUploaded/pushPulled/pushDelivered below) -- entirely
+               separate from the Replace -> Apply flow's progressPercent/
+               otaStageLabel/otaDeploying, which this must not touch. */
+            if (stage === "pushfiles") {
+                pushProgressPercent = progress;
+                pushStatus = msg;
+                /* ota_push_thread() (hms/ota/ota.c) reports exactly this text
+                   the moment the pull from the server finishes and it starts
+                   scp'ing the archive into the guest -- the one checkpoint
+                   that marks "2. Pull to host" done and "3. Send to guest"
+                   starting. */
+                if (msg.indexOf("Archive pulled") >= 0) pushPulled = true;
+                return;
+            }
             otaStageLabel = msg;
             progressPercent = progress;
             otaDeploying = true;
             otaStage = stage;
             var m = msg.match(/Pulling (.+?) \(/);
             if (m && m[1]) downloadFileName = m[1];
-            if (stage === "pushfiles") pushStatus = msg;
             if (stage === "apply" || stage === "restart") chkDownloaded = true;
             if (stage === "restart" && progress >= 100) chkApplied = true;
         }
 
         onOtaResult: (guest, success, msg) => {
+            /* Send to guest's own bar/tracker again -- never touches the
+               Replace -> Apply flow's progressPercent/otaDeploying/
+               otaStageLabel below. */
+            if (otaPhase === "push") {
+                pushingNow = false;
+                pushProgressPercent = success ? 100 : 0;
+                if (success) {
+                    pushDelivered = true;
+                    pushStatus = "Files delivered to the guest.";
+                    sendModel.clear();
+                } else {
+                    pushStatus = "Push failed: " + msg;
+                }
+                otaPhase = "";
+                mqtt.refreshGuests();
+                return;
+            }
+
             progressPercent = success ? 100 : 0;
             otaDeploying = false;
             otaStageLabel = (success ? "Done — " : "Failed — ") + msg;
+            lastOtaSucceeded = success;
 
             if (success) {
                 if (otaPhase === "fetch") {
-                    var r = (currentStageIdx >= 0 && currentStageIdx < stagedModel.count)
-                        ? stagedModel.get(currentStageIdx) : null;
-                    if (r && r.sent && !r.downloaded) {
-                        stagedModel.set(currentStageIdx, {
-                            destName: r.destName, local: r.local, serverPath: r.serverPath,
-                            sent: true, downloaded: true, state: "done"
-                        });
-                        log("success", "Pulled " + r.destName + " down to the host.");
+                    /* doFetch() now sends every pending file as one batched
+                       fetchOtaFiles() call (see its comment), so this single
+                       ota_result covers the whole batch, not one row picked
+                       out by currentStageIdx. Mark every row that was part
+                       of it -- still sent && !downloaded at this point,
+                       since nothing else can touch stagedModel while a fetch
+                       is outstanding -- as downloaded. */
+                    var pulled = 0;
+                    for (var fi = 0; fi < stagedModel.count; ++fi) {
+                        var r = stagedModel.get(fi);
+                        if (r.sent && !r.downloaded) {
+                            stagedModel.set(fi, {
+                                destName: r.destName, local: r.local, serverPath: r.serverPath,
+                                sent: true, downloaded: true, state: "done"
+                            });
+                            pulled++;
+                        }
                     }
+                    if (pulled > 0)
+                        log("success", "Pulled " + pulled + " file(s) down to the host.");
                     otaPhase = "";
                     doFetch();
                     return;
                 } else if (otaPhase === "apply") {
                     chkDownloaded = true; chkApplied = true;
-                } else if (otaPhase === "push") {
-                    pushingNow = false;
-                    pushStatus = "Files delivered to the guest.";
-                    sendModel.clear();
                 } else {
                     uploadingNow = false;
                 }
             } else {
-                if (otaPhase === "fetch" && currentStageIdx >= 0
-                    && currentStageIdx < stagedModel.count) {
-                    var f = stagedModel.get(currentStageIdx);
-                    stagedModel.set(currentStageIdx, {
-                        destName: f.destName, local: f.local, serverPath: "",
-                        sent: false, downloaded: false, state: ""
-                    });
-                } else if (otaPhase === "push") {
-                    pushingNow = false;
-                    pushStatus = "Push failed: " + msg;
+                if (otaPhase === "fetch") {
+                    /* Same batch as above: revert every row that was part of
+                       this failed fetch, not just one picked out by
+                       currentStageIdx. */
+                    for (var fj = 0; fj < stagedModel.count; ++fj) {
+                        var f = stagedModel.get(fj);
+                        if (f.sent && !f.downloaded) {
+                            stagedModel.set(fj, {
+                                destName: f.destName, local: f.local, serverPath: "",
+                                sent: false, downloaded: false, state: ""
+                            });
+                        }
+                    }
                 }
                 uploadingNow = false;
             }
@@ -493,11 +666,21 @@ ApplicationWindow {
             otaStageLabel = ok
                 ? "Uploaded " + localName + " — pulling it down to the host…"
                 : "Uploaded " + localName + " to the server.";
-            if (ok) doFetch();
+            /* Continue the upload loop, not doFetch() directly. uploadNext()
+               finds the next staged file that is not yet sent and uploads
+               it; only once every file has been sent (its own idx < 0 case)
+               does it hand off to doFetch() to start pulling them down.
+               Jumping straight to doFetch() here after just the FIRST file
+               skipped that loop entirely -- staging more than one file
+               uploaded and pulled only the first, then sat there: doFetch()
+               only ever looks for rows that are already "sent", and nothing
+               else was left to call uploadNext() again for the rest. */
+            if (ok) uploadNext();
         }
 
         onGenericUploaded: (serverPath) => {
             if (!pushingNow) return;
+            pushUploaded = true;
             pushStatus = "Archive is on the server — delivering it to the guest…";
             mqtt.pushFilesToGuest(selectedGuestId, serverPath);
         }
@@ -931,11 +1114,19 @@ ApplicationWindow {
 
         property string mode: "partition"
         property string selectedFile: ""
-        /* Was hardcoded to "/home/gemy/". mqtt.homePath is QDir::homePath(). */
-        property url currentFolder: "file://" + mqtt.homePath + "/"
+        /* Was hardcoded to "/home/gemy/". mqtt.homePath is QDir::homePath().
+           Reopens wherever the last pick (Replace or Add file -- they share
+           this same dialog) left off, via uiSettings.lastLocalFolder, rather
+           than always starting back at the home directory. */
+        property url currentFolder: uiSettings.lastLocalFolder !== ""
+            ? uiSettings.lastLocalFolder
+            : "file://" + mqtt.homePath + "/"
 
         onOpened: { selectedFile = ""; fileList.currentIndex = -1 }
-        onCurrentFolderChanged: { selectedFile = ""; fileList.currentIndex = -1 }
+        onCurrentFolderChanged: {
+            selectedFile = ""; fileList.currentIndex = -1;
+            uiSettings.lastLocalFolder = currentFolder.toString();
+        }
 
         function choose() {
             if (selectedFile === "") return;
@@ -960,6 +1151,36 @@ ApplicationWindow {
             showDotAndDotDot: false
             sortCaseSensitive: false
             nameFilters: ["*"]
+        }
+
+        /* Debounced "genuinely empty" check. FolderListModel's Ready+count=0
+           can be momentarily true for a folder that is NOT actually empty --
+           every reassignment of `folder` passes through Null first (count 0
+           there too, already handled above), and status/count can each land
+           on a given value for a single frame while the other one is still
+           catching up before both settle. Rather than trust any single
+           frame's reading, only call a folder empty once Ready+count=0 has
+           held for a beat -- long enough that a real (if brief) transition
+           can't be mistaken for it, short enough a genuinely empty folder
+           still reports promptly. */
+        property bool folderConfirmedEmpty: false
+        Timer {
+            id: emptyConfirm
+            interval: 350
+            onTriggered: filePicker.folderConfirmedEmpty = true
+        }
+        Connections {
+            target: folderModel
+            function onStatusChanged() { filePicker.recheckEmpty() }
+            function onCountChanged() { filePicker.recheckEmpty() }
+        }
+        function recheckEmpty() {
+            if (folderModel.status === FolderListModel.Ready && folderModel.count === 0) {
+                if (!folderConfirmedEmpty) emptyConfirm.restart();
+            } else {
+                emptyConfirm.stop();
+                folderConfirmedEmpty = false;
+            }
         }
 
         ColumnLayout {
@@ -1091,11 +1312,18 @@ ApplicationWindow {
 
                     Text {
                         anchors.centerIn: parent
-                        text: folderModel.status === FolderListModel.Loading
-                            ? "Loading…" : "Empty folder"
+                        /* "Empty folder" only once filePicker.recheckEmpty()
+                           has confirmed Ready+count=0 held for a beat, not
+                           on any single frame -- see the debounce next to
+                           folderModel above. Until then this stays hidden
+                           rather than guessing "Loading…" either: showing
+                           nothing during a folder with real content's brief
+                           in-between frames is a lot less alarming than
+                           telling the user it's empty and being wrong. */
+                        text: "Empty folder"
                         color: Theme.textDisabled
                         font.pixelSize: Theme.fontBody
-                        visible: folderModel.count === 0
+                        visible: filePicker.folderConfirmedEmpty
                     }
                 }
             }
@@ -1156,17 +1384,37 @@ ApplicationWindow {
             for (var i = 0; i < lines.length; ++i) {
                 var line = lines[i].trim();
                 if (line === "" || line.indexOf("total ") === 0) continue;
-                var toks = line.split(/\s+/);
-                if (toks.length < 9) continue;
-                var mode = toks[0];
-                var name = toks.slice(8).join(" ");
+                /* mode, links, owner, group, size are always exactly five
+                   whitespace-separated fields; everything after them is the
+                   timestamp then the name. The timestamp's own shape is NOT
+                   fixed across ls implementations: busybox/toybox (the
+                   guest images' own ls) print "Mon DD HH:MM" or "Mon DD
+                   YYYY" -- three fields -- but QNX's ls prints "YYYY-MM-DD
+                   HH:MM", two. Slicing the token array at a fixed index
+                   assumed the three-field form, so on a QNX guest every
+                   symlink's name came out as "-> target" (the slice landed
+                   one token into the arrow) and every OTHER row -- being one
+                   token short of the length this function required just to
+                   accept it -- was dropped outright: browsing a QNX guest
+                   showed next to nothing, and what little showed had the
+                   wrong name. Matching the first five fields with a regex
+                   and then stripping a recognized timestamp shape off the
+                   FRONT of whatever remains reads either format correctly. */
+                var m = line.match(/^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+)$/);
+                if (!m) continue;
+                var mode = m[1];
+                var sizeTok = m[5];
+                var dm = m[6].match(
+                    /^(?:[A-Za-z]{3}\s+\d{1,2}\s+(?:\d{1,2}:\d{2}|\d{4})|\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2})\s+(.+)$/);
+                if (!dm) continue;
+                var name = dm[1];
                 var cut = name.indexOf(" -> ");
                 if (cut > 0) name = name.substring(0, cut);
                 if (name === "." || name === "..") continue;
                 if (mode[0] === "d")
                     browseModel.append({ name: name, isDir: true, size: "" });
                 else if (mode[0] === "-" || mode[0] === "l")
-                    browseModel.append({ name: name, isDir: false, size: toks[4] });
+                    browseModel.append({ name: name, isDir: false, size: sizeTok });
             }
         }
 
@@ -1189,7 +1437,13 @@ ApplicationWindow {
             requestListing();
         }
 
-        onOpened: { browsePath = "/"; browseSelected = ""; requestListing() }
+        /* Reopens at uiSettings.lastGuestPath (the last place any browse
+           left off for any guest) instead of always resetting to root. */
+        onOpened: {
+            browsePath = uiSettings.lastGuestPath !== "" ? uiSettings.lastGuestPath : "/";
+            browseSelected = "";
+            requestListing();
+        }
 
         ColumnLayout {
             anchors.fill: parent
