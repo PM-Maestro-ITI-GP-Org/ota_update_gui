@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Window
 import PdM.Core
 import PdM.Ota
 
@@ -22,6 +23,14 @@ ApplicationWindow {
     height: 920
     minimumWidth: 1080
     minimumHeight: 700
+    /* Maximized, not FullScreen: FullScreen drops the window manager's
+       decorations (title bar, border, minimize/maximize/close buttons) on
+       most window managers, leaving no on-screen way to unmaximize or quit.
+       Maximized fills the screen the same way but keeps that chrome.
+
+       Standalone only. Inside Maestro the shell owns the window, and a tab
+       does not get an opinion about how the window is shown. */
+    visibility: Window.Maximized
     title: qsTr("Hypervisor Management — OTA Update")
     color: Theme.background
 

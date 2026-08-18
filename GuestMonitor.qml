@@ -8,15 +8,24 @@ import "StatsParser.js" as Stats
 /*
  * Live host and guest statistics.
  *
- * Same parsing as before (StatsParser.js is untouched), restyled onto the
- * shared theme with larger type. Two changes beyond looks:
+ * Every running guest is shown automatically now, alongside the hypervisor
+ * host, with no selection step. It used to poll exactly one target at a time
+ * -- whichever guest a picker in the header was set to -- and every other
+ * guest simply had no way to appear on this page at all. Two guests running
+ * side by side meant clicking back and forth to see one at a time.
  *
- *  - `enabled` is no longer redeclared. Item already has an `enabled` property
- *    and shadowing it meant "this tab is visible" and "this item accepts input"
- *    were the same flag, so the page's own controls went dead whenever polling
- *    was meant to stop. It is `active` now.
- *  - The stat cards use a Flow, so they wrap instead of being squeezed to
- *    illegibility on a narrow window.
+ * The page now asks HMS about the host plus every guest currently reported
+ * as running (from the shared guest list) on each poll, and renders one card
+ * per reply that comes back running. A guest that stops -- or was never
+ * running -- gets no card at all, per the same rule the host always follows:
+ * the hypervisor card is the one constant, guest cards come and go with
+ * whether qvm actually has them up.
+ *
+ * This relies on hms/main.c's per-target stats coalescing (see stats_targets
+ * there): asking about several guests and the host at once only works
+ * cleanly because each target now has its own in-flight slot instead of
+ * sharing one, which used to let concurrent targets stomp on each other's
+ * bookkeeping.
  */
 Item {
     id: root
@@ -27,42 +36,57 @@ Item {
     property var mqttRef: null
     property bool autoRefresh: true
 
-    /* Set by main.qml; drives the guest picker in the header. Named `guests`,
-       not `guestsModel`: a property of that name would shadow main.qml.s
-       ListModel id and `guestsModel: guestsModel` would bind to itself. */
+    /* Set by main.qml; the source of truth for which guests exist and which
+       of them qvm currently has running. */
     property var guests: null
-    /* 5s, not 3s. Each poll parses a few hundred lines of `top`/`pidin` output
-       in JS on the GUI thread and then refills two list models, so the interval
-       is a direct tax on how responsive the whole app feels. */
-    /* 15s, not 5s. A poll SSHes into the guest and the round trip measures
-       ~21s on the board, so a 5s timer only ever queued work that the
-       requestInFlight guard then threw away -- and made the CPU% deltas, which
-       are computed against this interval, wrong whenever one did get through. */
+    /* 15s, not 5s or 3s. Each poll parses a few hundred lines of `top`/`pidin`
+       output in JS on the GUI thread and then refills a list model per
+       target, so the interval is a direct tax on how responsive the whole
+       app feels. A guest stats round trip also measures ~21s on the board
+       (the ssh handshake alone is ~10s), so anything shorter than that just
+       queues work that the previous poll's watchdog then throws away. */
     property int  pollIntervalMs: 15000
 
-    /* Only the busiest processes are worth showing, and the cost of the refill
-       is proportional to how many rows there are. A QNX host reports hundreds;
-       the view is sorted by CPU descending, so the tail is all idle. */
-    property int  maxRows: 60
+    /* Every process that arrives is worth showing now: the QNX top table is
+       capped at 100 threads on the host side, and a Linux guest's full table
+       fits comfortably here. The view is sorted by CPU descending, and the
+       cost of the refill is proportional to how many rows there are. */
+    property int  maxRows: 400
 
-    property string guestId: ""
-    property string guestName: ""
-    property string guestIp: ""
-    property bool   guestRunning: false
-    property string guestError: ""
     property string lastUpdated: ""
     property string statusText: ""
-    property bool   requestInFlight: false
+
+    /* Which cards the user wants to see. Host is a single toggle; each guest
+       carries its own "selected" role on its guestCards row (set true when
+       the row is created in syncCards(), so a guest that only just started
+       is shown by default rather than hidden until the user opts it in). */
+    property bool hostSelected: true
+
+    /* Targets ("" for host, a guest id otherwise) currently awaiting a
+       reply. A plain map for membership tests in JS; inFlightCount is the
+       property bindings actually watch, since mutating a `var` map in place
+       does not raise a change notification on its own. */
+    property var inFlight: ({})
+    property int inFlightCount: 0
 
     signal requestStats(string id)
 
     ListModel { id: hostProcs }
-    ListModel { id: guestProcs }
-
     property var hostSnap: null
-    property var guestSnap: null
     property var hostSummary: null
-    property var guestSummary: null
+
+    /* One row per guest currently shown: gid, name, ip, statsRunning (HMS
+       could reach it over ssh), error, hostname, loadText, cpusText,
+       ramUsedBytes, ramTotalBytes, kernel, lastUpdated. Rows are added and
+       removed by syncCards() to track root.guests, and filled in by
+       onStats(). */
+    ListModel { id: guestCards }
+    /* gid -> ListModel of that guest's processes, and gid -> its previous
+       snapshot (for the CPU% delta). Neither is read from a QML binding, so
+       plain JS mutation is fine -- these exist purely as lookup tables for
+       onStats() and are not something the UI observes directly. */
+    property var procModelsByGuest: ({})
+    property var prevGuestSnaps: ({})
 
     /*
      * Update in place rather than clear-and-refill.
@@ -72,6 +96,7 @@ Item {
      * hitch was. Setting existing rows leaves the delegates alone.
      */
     function fillModel(model, view) {
+        if (!model) return
         var n = Math.min(view.length, maxRows)
         for (var i = 0; i < n; i++) {
             var p = view[i]
@@ -88,19 +113,55 @@ Item {
             model.remove(model.count - 1)
     }
 
-    function setGuest(id, name, ip, running) {
-        if (mqttRef) mqttRef.diag("monitor", "setGuest('" + id + "') was='" + guestId + "' inFlight=" + requestInFlight)
-        requestInFlight = false
-        watchdog.stop()
-        guestId = id
-        guestName = name || ""
-        guestIp = ip || ""
-        guestRunning = running
-        guestSnap = null
-        guestSummary = null
-        guestProcs.clear()
-        statusText = ""
-        if (active) refreshNow()
+    function cardIndex(gid) {
+        for (var i = 0; i < guestCards.count; ++i)
+            if (guestCards.get(i).gid === gid) return i
+        return -1
+    }
+
+    /* Bring guestCards in step with which guests qvm currently has running.
+       A guest that is not running gets no card -- not a "stopped" card, an
+       absent one, per the rule this page now follows throughout. */
+    function syncCards() {
+        if (!root.guests) return
+        var wanted = {}
+        for (var i = 0; i < root.guests.count; ++i) {
+            var g = root.guests.get(i)
+            if (!g.running) continue
+            wanted[g.id] = true
+            var idx = cardIndex(g.id)
+            if (idx < 0) {
+                /* Create the proc model BEFORE appending the row. The
+                   Repeater instantiates its delegate synchronously as soon
+                   as the row lands in guestCards, and the delegate's
+                   ProcTable reads procModelsByGuest[gid] once at that
+                   instant -- appending first left it reading a key that did
+                   not exist yet, which crashed with "Cannot read property
+                   'count' of null" the moment a second guest came up. */
+                if (!procModelsByGuest[g.id])
+                    procModelsByGuest[g.id] = Qt.createQmlObject(
+                        "import QtQuick; ListModel {}", root, "procModel_" + g.id)
+                guestCards.append({
+                    gid: g.id, name: g.name || "", ip: g.ip || "",
+                    statsRunning: false, error: "",
+                    hostname: "", loadText: "—", cpusText: "—",
+                    ramUsedBytes: 0, ramTotalBytes: 0, kernel: "",
+                    lastUpdated: "", selected: true
+                })
+            } else {
+                if (guestCards.get(idx).name !== (g.name || ""))
+                    guestCards.setProperty(idx, "name", g.name || "")
+                if (guestCards.get(idx).ip !== (g.ip || ""))
+                    guestCards.setProperty(idx, "ip", g.ip || "")
+            }
+        }
+        for (var k = guestCards.count - 1; k >= 0; --k) {
+            var gid = guestCards.get(k).gid
+            if (!wanted[gid]) guestCards.remove(k)
+            /* procModelsByGuest/prevGuestSnaps for gid are deliberately kept:
+               the same guest restarting a poll or two later refills them
+               instead of starting from an empty table again. */
+        }
     }
 
     function onStats(json) {
@@ -108,67 +169,59 @@ Item {
         try {
             obj = JSON.parse(json)
         } catch (e) {
-            requestInFlight = false
-            watchdog.stop()
             statusText = "Parse error: " + e.message
             return
         }
-        /*
-         * Is this reply for what the page is showing NOW?
-         *
-         * The check comes BEFORE requestInFlight is cleared, and that ordering
-         * is the whole point. It used to be the other way round: any reply
-         * cleared the flag, and then a mismatched one called refreshNow() to
-         * ask again. Switching host -> guest -> host makes several replies
-         * arrive for targets that are no longer selected, and each one cleared
-         * the flag and fired a fresh request, whose reply could itself arrive
-         * mismatched after the next switch. A request storm, and the page
-         * hung parsing replies to questions nobody was asking any more.
-         *
-         * A reply for someone else is simply dropped now. Our own request is
-         * still outstanding -- the flag was never cleared -- so its reply lands
-         * normally, and the watchdog covers the case where it never does.
-         *
-         * A missing guest_id reads as "", which is what a host-only reply
-         * carries, so such a reply is not accepted while a guest is selected.
-         * It used to be, and it blanked the guest panel.
-         */
         var replyFor = (obj.guest_id === undefined || obj.guest_id === null)
                        ? "" : obj.guest_id
-        if (replyFor !== guestId) {
-            if (mqttRef) mqttRef.diag("monitor", "DROP reply for '" + replyFor + "', showing '" + guestId + "'")
+
+        /* Accept a reply for any target we actually asked about, not only a
+           single "currently selected" one -- that restriction is what used
+           to make it impossible to show more than one guest at a time. A
+           reply for a target we are not waiting on (a stale one from before
+           a guest disappeared, say) is dropped. */
+        if (!inFlight[replyFor]) {
+            if (mqttRef) mqttRef.diag("monitor", "DROP unexpected reply for '" + replyFor + "'")
             return
         }
-        if (mqttRef) mqttRef.diag("monitor", "accept reply for '" + replyFor + "'")
-
-        requestInFlight = false
-        watchdog.stop()
+        delete inFlight[replyFor]
+        inFlightCount = Math.max(0, inFlightCount - 1)
+        if (inFlightCount === 0) watchdog.stop()
 
         lastUpdated = Qt.formatTime(new Date(), "hh:mm:ss")
         statusText = ""
 
         try {
-            var h = Stats.parseSnapshot(obj.host)
-            hostSummary = h
-            var prevH = hostSnap
-            hostSnap = h
-            fillModel(hostProcs, Stats.buildView(h, prevH, pollIntervalMs))
+            if (replyFor === "") {
+                var h = Stats.parseSnapshot(obj.host)
+                hostSummary = h
+                var prevH = hostSnap
+                hostSnap = h
+                fillModel(hostProcs, Stats.buildView(h, prevH, pollIntervalMs))
+                return
+            }
 
-            guestRunning = (obj.guest_running === true)
-            /* HMS now says why the guest half is missing instead of just
-               omitting it, which used to be indistinguishable from the guest
-               being stopped. */
-            guestError = obj.guest_error || ""
-            if (guestRunning && obj.guest && obj.guest !== "") {
+            var idx = cardIndex(replyFor)
+            if (idx < 0) return   /* stopped or removed between request and reply */
+
+            var running = (obj.guest_running === true)
+            guestCards.setProperty(idx, "statsRunning", running)
+            guestCards.setProperty(idx, "error", obj.guest_error || "")
+            guestCards.setProperty(idx, "lastUpdated", lastUpdated)
+
+            if (running && obj.guest && obj.guest !== "") {
                 var g = Stats.parseSnapshot(obj.guest)
-                guestSummary = g
-                var prevG = guestSnap
-                guestSnap = g
-                fillModel(guestProcs, Stats.buildView(g, prevG, pollIntervalMs))
-            } else {
-                guestSnap = null
-                guestSummary = null
-                guestProcs.clear()
+                var prevG = prevGuestSnaps[replyFor] || null
+                prevGuestSnaps[replyFor] = g
+                guestCards.setProperty(idx, "hostname", g.hostname || "—")
+                guestCards.setProperty(idx, "loadText", loadText(g))
+                guestCards.setProperty(idx, "cpusText",
+                    g.cpus > 0 ? String(g.cpus) + (g.threads > 0 ? " · " + g.threads + " threads" : "")
+                               : "—")
+                guestCards.setProperty(idx, "ramUsedBytes", g.ram.used || 0)
+                guestCards.setProperty(idx, "ramTotalBytes", g.ram.total || 0)
+                guestCards.setProperty(idx, "kernel", g.kernel || "—")
+                fillModel(procModelsByGuest[replyFor], Stats.buildView(g, prevG, pollIntervalMs))
             }
         } catch (e2) {
             statusText = "Parse error: " + e2.message
@@ -179,18 +232,14 @@ Item {
      * The broker went away and came back.
      *
      * A request that was outstanding when the link dropped is never answered:
-     * HMS's reply went to a session that no longer exists. requestInFlight
-     * stayed true through all of it, so the page sat with Refresh disabled and
-     * "No respon." on the button until its own 60s watchdog expired -- long
-     * after the client had reconnected two seconds later and everything was
-     * working again. That wait is the whole visible cost of a dropped
-     * connection, and it is entirely self-inflicted.
-     *
-     * Clear the in-flight state and ask again immediately.
+     * HMS's reply went to a session that no longer exists. Clearing every
+     * in-flight target and asking again immediately means the page does not
+     * sit waiting out its own 60s watchdog for a link that is already back.
      */
     function onLinkChanged(up) {
-        if (mqttRef) mqttRef.diag("monitor", "link " + (up ? "up" : "down") + " inFlight=" + requestInFlight)
-        requestInFlight = false
+        if (mqttRef) mqttRef.diag("monitor", "link " + (up ? "up" : "down") + " inFlight=" + inFlightCount)
+        inFlight = ({})
+        inFlightCount = 0
         watchdog.stop()
         if (!up) {
             statusText = "Link lost"
@@ -201,12 +250,25 @@ Item {
     }
 
     function refreshNow() {
-        if (mqttRef) mqttRef.diag("monitor", "refreshNow('" + guestId + "') inFlight=" + requestInFlight + " active=" + active)
-        if (requestInFlight) return
-        requestInFlight = true
-        statusText = "Fetching…"
-        watchdog.start()
-        requestStats(guestId)
+        syncCards()
+        var targets = [""]
+        for (var i = 0; i < guestCards.count; ++i)
+            targets.push(guestCards.get(i).gid)
+
+        var fired = false
+        for (var t = 0; t < targets.length; ++t) {
+            var id = targets[t]
+            if (inFlight[id]) continue
+            inFlight[id] = true
+            inFlightCount++
+            fired = true
+            requestStats(id)
+        }
+        if (mqttRef) mqttRef.diag("monitor", "refreshNow: " + targets.length + " target(s), " + inFlightCount + " in flight")
+        if (fired) {
+            statusText = "Fetching…"
+            watchdog.start()
+        }
     }
 
     function loadText(s) {
@@ -224,8 +286,21 @@ Item {
         property string label: ""
         property string value: ""
         property int minWidth: 170
+        /* 0 = uncapped (unchanged for every other Stat use). KERNEL sets this:
+           its value is a full `uname -a` line, and a Linux guest's is much
+           longer than a QNX one's -- Text.implicitWidth reflects the FULL
+           unwrapped string regardless of the elide set on valueText below
+           (elide only trims what is actually painted, not the reported
+           implicit size), so without a cap this tile alone could balloon to
+           4-5x a QNX card's width. That widened the Flow's row (or pushed it
+           onto an extra row) only for whichever guest had the longer kernel
+           string, which ate into that specific card's fixed-height ProcTable
+           below it and made it visibly shorter than the other cards'. */
+        property int maxWidth: 0
 
-        implicitWidth: Math.max(minWidth, valueText.implicitWidth + 28)
+        implicitWidth: maxWidth > 0
+            ? Math.max(minWidth, Math.min(valueText.implicitWidth + 28, maxWidth))
+            : Math.max(minWidth, valueText.implicitWidth + 28)
         implicitHeight: 74
         radius: Theme.radiusSmall
         color: Theme.surfaceSunken
@@ -419,10 +494,10 @@ Item {
             SectionTitle {
                 Layout.fillWidth: true
                 title: "System monitor"
-                subtitle: root.guestId !== ""
-                    ? "Hypervisor host and guest " + root.guestId +
-                      (root.guestIp !== "" && root.guestIp !== "-" ? " (" + root.guestIp + ")" : "")
-                    : "Hypervisor host only — choose a guest to monitor it alongside."
+                subtitle: guestCards.count > 0
+                    ? "Hypervisor host and " + guestCards.count + " running guest"
+                      + (guestCards.count > 1 ? "s" : "") + " — shown automatically."
+                    : "Hypervisor host only — no guest is currently running."
             }
 
             Text {
@@ -430,93 +505,6 @@ Item {
                 color: Theme.textSecondary
                 font.pixelSize: Theme.fontSmall
                 Layout.alignment: Qt.AlignVCenter
-            }
-
-            /*
-             * Guest picker.
-             *
-             * The page told you to "click a row on the Guests page", which is
-             * one way in and was the only one -- landing here from the
-             * navigation rail left you reading an instruction with nothing on
-             * screen to act on. Clicking a guest row still works and still
-             * lands here; this just stops that being mandatory.
-             */
-            ComboBox {
-                id: guestPicker
-                Layout.preferredWidth: 240
-                Layout.preferredHeight: Theme.controlHeight
-                font.pixelSize: Theme.fontBody
-                textRole: "label"
-                valueRole: "id"
-                enabled: root.guests && root.guests.count > 0
-                Material.foreground: Theme.textPrimary
-                Material.accent: Theme.primary
-
-                /* "(host only)" first, then every guest. Rebuilt whenever the
-                   list changes so a guest appearing or disappearing does not
-                   silently shift the selection onto a different one. */
-                model: ListModel { id: pickerModel }
-
-                function rebuild() {
-                    var keep = root.guestId;
-                    pickerModel.clear();
-                    pickerModel.append({ label: "Host only", id: "" });
-                    if (root.guests) {
-                        for (var i = 0; i < root.guests.count; ++i) {
-                            var g = root.guests.get(i);
-                            pickerModel.append({
-                                label: g.id + (g.running ? "" : "  (stopped)"),
-                                id: g.id
-                            });
-                        }
-                    }
-                    for (var j = 0; j < pickerModel.count; ++j)
-                        if (pickerModel.get(j).id === keep) { currentIndex = j; return }
-                    currentIndex = 0;
-                }
-
-                onActivated: {
-                    var id = pickerModel.get(currentIndex).id;
-                    if (id === "") { root.setGuest("", "", "", false); return }
-                    for (var i = 0; i < root.guests.count; ++i) {
-                        var g = root.guests.get(i);
-                        if (g.id === id) { root.setGuest(g.id, g.name, g.ip, g.running); return }
-                    }
-                }
-
-                /*
-                 * Labels carry live state ("(stopped)"), so they have to follow
-                 * the model's CONTENTS, not just its length.
-                 *
-                 * main.qml updates the guest rows in place, so starting a guest
-                 * changes its `running` field while the row count stays the
-                 * same. Watching only onCountChanged left this frozen at
-                 * whatever the guests happened to be when the page first
-                 * loaded -- the picker went on saying "(stopped)" for a guest
-                 * the Guests tab was showing as running.
-                 *
-                 * Labels are patched rather than rebuilt: rebuild() clears the
-                 * model, which would collapse the dropdown under the user if it
-                 * happened to be open when a poll landed.
-                 */
-                function syncLabels() {
-                    if (!root.guests) return;
-                    /* row 0 is "Host only", so guest i lives at row i + 1 */
-                    for (var i = 0; i < root.guests.count && i + 1 < pickerModel.count; ++i) {
-                        var g = root.guests.get(i);
-                        var want = g.id + (g.running ? "" : "  (stopped)");
-                        if (pickerModel.get(i + 1).label !== want)
-                            pickerModel.setProperty(i + 1, "label", want);
-                    }
-                }
-
-                Component.onCompleted: rebuild()
-
-                Connections {
-                    target: root.guests
-                    function onCountChanged() { guestPicker.rebuild() }
-                    function onDataChanged()  { guestPicker.syncLabels() }
-                }
             }
 
             Switch {
@@ -533,9 +521,45 @@ Item {
                 implicitHeight: Theme.controlHeight
                 implicitWidth: 130
                 font.pixelSize: Theme.fontBody
-                enabled: root.active && !root.requestInFlight
+                enabled: root.active && root.inFlightCount === 0
                 accent: Theme.primary
                 onClicked: root.refreshNow()
+            }
+        }
+
+        /* Which cards to show. All on by default -- unchecking one just hides
+           its card below, it does not stop polling it (unselecting the
+           hypervisor host while still watching a guest would otherwise have
+           to keep the host request in flight anyway, since it always answers
+           in the same round). */
+        Flow {
+            Layout.fillWidth: true
+            spacing: Theme.spacingTight
+
+            CheckBox {
+                text: "Hypervisor host"
+                checked: root.hostSelected
+                font.pixelSize: Theme.fontSmall
+                Material.foreground: Theme.textPrimary
+                Material.accent: Theme.primary
+                onToggled: root.hostSelected = checked
+            }
+
+            Repeater {
+                model: guestCards
+                delegate: CheckBox {
+                    required property int index
+                    required property string gid
+                    required property string name
+                    required property bool selected
+
+                    text: "Guest — " + gid + (name !== "" && name !== "-" ? " · " + name : "")
+                    checked: selected
+                    font.pixelSize: Theme.fontSmall
+                    Material.foreground: Theme.textPrimary
+                    Material.accent: Theme.primary
+                    onToggled: guestCards.setProperty(index, "selected", checked)
+                }
             }
         }
 
@@ -549,10 +573,11 @@ Item {
                 width: root.width
                 spacing: Theme.spacing
 
-                /* ---- host ---- */
+                /* ---- host: shown whenever selected ---- */
                 AppCard {
                     Layout.fillWidth: true
                     Layout.preferredHeight: 400
+                    visible: root.hostSelected
 
                     ColumnLayout {
                         anchors.fill: parent
@@ -590,6 +615,7 @@ Item {
                             Stat {
                                 label: "KERNEL"
                                 minWidth: 320
+                                maxWidth: 420
                                 value: root.hostSummary ? (root.hostSummary.kernel || "—") : "—"
                             }
                         }
@@ -603,113 +629,102 @@ Item {
                     }
                 }
 
-                /* ---- guest ---- */
-                AppCard {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: root.guestRunning ? 400 : 140
+                /* ---- one card per guest currently running; none otherwise ---- */
+                Repeater {
+                    model: guestCards
 
-                    ColumnLayout {
-                        anchors.fill: parent
-                        spacing: Theme.spacingTight
+                    delegate: AppCard {
+                        required property string gid
+                        required property string name
+                        required property string ip
+                        required property bool statsRunning
+                        required property string error
+                        required property string hostname
+                        required property string loadText
+                        required property string cpusText
+                        required property real ramUsedBytes
+                        required property real ramTotalBytes
+                        required property string kernel
+                        required property bool selected
 
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Text {
-                                text: root.guestId !== ""
-                                    ? "Guest — " + root.guestId +
-                                      (root.guestName !== "" && root.guestName !== "-" ? " · " + root.guestName : "")
-                                    : "Guest"
-                                color: Theme.textPrimary
-                                font.pixelSize: Theme.fontMedium
-                                font.weight: Font.DemiBold
-                                Layout.fillWidth: true
-                                elide: Text.ElideRight
-                            }
-                            StatusPill {
-                                visible: root.guestId !== ""
-                                text: root.guestRunning ? "running" : "stopped"
-                                tone: root.guestRunning ? "success" : "danger"
-                            }
-                        }
+                        Layout.fillWidth: true
+                        /* Fixed at 400 regardless of statsRunning, matching the
+                           hypervisor host card and every other guest card --
+                           the old "140 while waiting for the first reply"
+                           made the row heights jump around, and made a guest
+                           still booting look like a smaller, lesser card. */
+                        Layout.preferredHeight: 400
+                        visible: selected
 
-                        Text {
-                            Layout.fillWidth: true
-                            visible: root.guestId === ""
-                            text: "No guest selected — pick one from the list above, "
-                                + "or click a guest row on the Guests page."
-                            color: Theme.textSecondary
-                            font.pixelSize: Theme.fontBody
-                            wrapMode: Text.Wrap
-                        }
-
-                        /* Shown when the guest is stopped, AND when it is running
-                           but the stats could not be collected.
-
-                           This used to be gated on !guestRunning alone, which
-                           was fine only while HMS reported a failed stats fetch
-                           as "not running". Now that those are two separate
-                           facts, a running guest whose fetch failed fell
-                           between them: empty tiles, an empty process table,
-                           and not a word about why. */
                         ColumnLayout {
-                            Layout.fillWidth: true
-                            visible: root.guestId !== ""
-                                     && (!root.guestRunning || root.guestError !== "")
-                            spacing: 4
-
-                            Text {
-                                Layout.fillWidth: true
-                                text: root.guestError !== ""
-                                    ? (root.guestRunning
-                                        ? "Guest is running, but HMS could not collect statistics from it."
-                                        : "No statistics for this guest — HMS could not reach it over SSH.")
-                                    : "Guest is not running — nothing to report."
-                                color: Theme.warning
-                                font.pixelSize: Theme.fontBody
-                                wrapMode: Text.Wrap
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                visible: root.guestError !== ""
-                                text: root.guestError
-                                color: Theme.textSecondary
-                                font.family: Theme.monoFamily
-                                font.pixelSize: Theme.fontSmall
-                                wrapMode: Text.WrapAnywhere
-                            }
-                        }
-
-                        Flow {
-                            Layout.fillWidth: true
-                            visible: root.guestRunning
+                            anchors.fill: parent
                             spacing: Theme.spacingTight
 
-                            Stat { label: "HOSTNAME"; value: root.guestSummary ? (root.guestSummary.hostname || "—") : "—" }
-                            Stat { label: "LOAD";     value: root.loadText(root.guestSummary) }
-                            Stat {
-                                label: "CPUS"
-                                value: root.guestSummary && root.guestSummary.cpus > 0
-                                    ? String(root.guestSummary.cpus) +
-                                      (root.guestSummary.threads > 0 ? " · " + root.guestSummary.threads + " threads" : "")
-                                    : "—"
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Text {
+                                    text: "Guest — " + gid + (name !== "" && name !== "-" ? " · " + name : "")
+                                    color: Theme.textPrimary
+                                    font.pixelSize: Theme.fontMedium
+                                    font.weight: Font.DemiBold
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideRight
+                                }
+                                StatusPill {
+                                    text: "running"
+                                    tone: "success"
+                                }
                             }
-                            RamStat {
-                                usedBytes: (root.guestSummary && root.guestSummary.ram.used) ? root.guestSummary.ram.used : 0
-                                totalBytes: (root.guestSummary && root.guestSummary.ram.total) ? root.guestSummary.ram.total : 0
-                            }
-                            Stat {
-                                label: "KERNEL"
-                                minWidth: 320
-                                value: root.guestSummary ? (root.guestSummary.kernel || "—") : "—"
-                            }
-                        }
 
-                        ProcTable {
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            visible: root.guestRunning
-                            procModel: guestProcs
-                            emptyText: "Guest process data appears on the next poll."
+                            /* The guest itself is running (that came straight
+                               from the guest list, which is authoritative) --
+                               this fires only when HMS could not collect
+                               stats from it over SSH, which used to be
+                               indistinguishable from the guest being down. */
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                visible: !statsRunning
+                                spacing: 4
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: error !== ""
+                                        ? "Guest is running, but HMS could not collect statistics from it yet."
+                                        : "Waiting for the first reply from this guest…"
+                                    color: Theme.warning
+                                    font.pixelSize: Theme.fontBody
+                                    wrapMode: Text.Wrap
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    visible: error !== ""
+                                    text: error
+                                    color: Theme.textSecondary
+                                    font.family: Theme.monoFamily
+                                    font.pixelSize: Theme.fontSmall
+                                    wrapMode: Text.WrapAnywhere
+                                }
+                            }
+
+                            Flow {
+                                Layout.fillWidth: true
+                                visible: statsRunning
+                                spacing: Theme.spacingTight
+
+                                Stat { label: "HOSTNAME"; value: hostname || "—" }
+                                Stat { label: "LOAD";     value: loadText }
+                                Stat { label: "CPUS";     value: cpusText }
+                                RamStat { usedBytes: ramUsedBytes; totalBytes: ramTotalBytes }
+                                Stat { label: "KERNEL"; minWidth: 320; maxWidth: 420; value: kernel || "—" }
+                            }
+
+                            ProcTable {
+                                Layout.fillWidth: true
+                                Layout.fillHeight: true
+                                visible: statsRunning
+                                procModel: root.procModelsByGuest[gid]
+                                emptyText: "Guest process data appears on the next poll."
+                            }
                         }
                     }
                 }
@@ -724,16 +739,11 @@ Item {
         interval: root.pollIntervalMs
         repeat: true
         running: root.active && root.autoRefresh
-        onTriggered: {
-            /* Skip while a request is outstanding: each one SSHes into the
-               guest and can take seconds, so polling regardless would backlog
-               HMS. */
-            if (!root.requestInFlight) {
-                root.requestInFlight = true
-                watchdog.start()
-                root.requestStats(root.guestId)
-            }
-        }
+        /* refreshNow() guards every target individually, so it is always
+           safe to call on a tick -- a target still answering from the last
+           round is simply skipped, while the host (usually done in well
+           under a second) or a guest that just finished gets asked again. */
+        onTriggered: root.refreshNow()
     }
 
     Timer {
@@ -742,31 +752,33 @@ Item {
          * Must outlast HMS's own ssh cap, or this gives up on every single
          * guest poll.
          *
-         * It was 15s while a guest stats round trip measures ~21s on the board
-         * -- the ssh handshake into the guest alone is ~10s. So the watchdog
-         * fired first, every time, cleared requestInFlight, printed "No
-         * response", and let the poll timer fire a fresh request that the reply
-         * to the previous one then raced. The Monitor never settled even when
-         * HMS answered perfectly.
-         *
          * HMS kills its own ssh at 45s and replies immediately after, so 60s
          * leaves room for that plus the round trip to the broker. This is the
-         * backstop for HMS being gone entirely, not a latency budget.
+         * backstop for HMS being gone entirely, not a latency budget -- and
+         * now covers however many targets are in flight at once, not just one.
          */
         interval: 60000
         repeat: false
         onTriggered: {
-            if (root.mqttRef) root.mqttRef.diag("monitor", "WATCHDOG fired for '" + root.guestId + "'")
-            root.requestInFlight = false
+            if (root.mqttRef) root.mqttRef.diag("monitor", "WATCHDOG fired, " + root.inFlightCount + " target(s) still pending")
+            root.inFlight = ({})
+            root.inFlightCount = 0
             root.statusText = "No response — will retry"
         }
     }
 
+    Connections {
+        target: root.guests
+        function onCountChanged() { root.syncCards() }
+        function onDataChanged()  { root.syncCards() }
+    }
+
     onActiveChanged: {
         if (mqttRef)
-            mqttRef.diag("monitor", "active=" + active + " inFlight=" + requestInFlight
-                                    + " guest='" + guestId + "'")
+            mqttRef.diag("monitor", "active=" + active + " inFlight=" + inFlightCount)
         if (active) refreshNow()
-        else { requestInFlight = false; watchdog.stop() }
+        else { inFlight = ({}); inFlightCount = 0; watchdog.stop() }
     }
+
+    Component.onCompleted: syncCards()
 }
