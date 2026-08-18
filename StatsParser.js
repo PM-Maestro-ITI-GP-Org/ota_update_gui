@@ -17,6 +17,14 @@ function isStatsNoise(name) {
     switch (base) {
         case "head": case "top": case "grep": case "sh": case "ps": case "tail":
         case "head -n 400": case "top -b -n 1":
+        /* "top -b -n 1" is only the Linux probe (piped to `grep -q COMMAND`
+           to check the flag is accepted) -- the command that actually
+           produces the captured table on a Linux guest is "top -b -n 2 -d 1"
+           (see STATS_CMD in hms/main.c). That name was missing here, so on
+           every poll the guest's own stats-gathering top showed up in its
+           own process table as a row named "top -b -n 2 -d 1", indistinguishable
+           from a real process. */
+        case "top -b -n 2 -d 1":
         case "top -b -i 1 -z 100": case "grep -q COMMAND":
         case "ps aux": case "ps -A":
             return true
@@ -578,9 +586,26 @@ function parseSnapshot(raw) {
     for (var cn in commNames) {
         var cp = procByPid[cn]
         if (cp && cp.name) {
+            var raw = commNames[cn]
             var brack = cp.name.charAt(0) === "[" &&
                         cp.name.charAt(cp.name.length - 1) === "]"
-            cp.name = brack ? "[" + commNames[cn] + "]" : commNames[cn]
+            /* A bracketed (kernel-thread) name at exactly 15 chars has hit
+               TASK_COMM_LEN (16 bytes, including the NUL) -- the kernel's own
+               struct field, not a display-width cut. "kworker/R-dm_bufio"
+               is stored, and readable from ANY tool including this section's
+               own /proc/PID/comm read, only as "kworker/R-dm_bu": there is
+               no longer form left anywhere in kernel state to recover, which
+               is what makes this different from the exe-recovery case just
+               below (a userspace comm truncation, where the full name still
+               exists on disk at /proc/PID/exe). Mark it with an ellipsis so
+               it reads as "shortened", not "corrupted" -- a real bug in an
+               earlier version of this parser. Non-bracketed names are left
+               alone here; they still get a chance at the exe-based full
+               recovery immediately below. */
+            if (brack && raw.length === 15)
+                cp.name = "[" + raw + "…]"
+            else
+                cp.name = brack ? "[" + raw + "]" : raw
         }
     }
     /* comm itself is kernel-truncated to 15 chars (systemd-timesyn for
@@ -628,6 +653,15 @@ function buildView(snap, prev, elapsedMs) {
     var out = []
     for (var j = 0; j < snap.procs.length; j++) {
         var pr = snap.procs[j]
+        /* Kernel threads ("[kworker/...]", "[jbd2/vda-8]", "[ksoftirqd/0]", …)
+           are real and correctly named, but they are Linux/kernel internals
+           with nothing an operator watching a guest's applications can act
+           on -- they only add noise a QNX guest's process list never has
+           (QNX has no bracket-wrapped kernel-thread convention). Drop them
+           here rather than in parseSnapshot(), so they still count toward
+           snap.cpuBusyPct/ram.used (computed earlier from the full snapshot)
+           and this filtering only affects what the table displays. */
+        if (pr.name && pr.name.charAt(0) === "[") continue
         var cpu = null
         /* pidin times / top TIME column are cumulative CPU time; the delta
            between two polls is the real per-process CPU% over the interval.
