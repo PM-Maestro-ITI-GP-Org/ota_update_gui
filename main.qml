@@ -26,6 +26,11 @@ ApplicationWindow {
     minimumWidth: 1080
     minimumHeight: 700
     visible: true
+    /* Maximized, not FullScreen: FullScreen drops the window manager's
+       decorations (title bar, border, minimize/maximize/close buttons) on
+       most window managers, leaving no on-screen way to unmaximize or quit.
+       Maximized fills the screen the same way but keeps that chrome. */
+    visibility: Window.Maximized
     title: "Hypervisor Management — OTA Update"
 
     color: Theme.background
