@@ -648,8 +648,8 @@ ApplicationWindow {
                 }
 
     /* Scripted control (OTA_GUI_CONTROL=<port>). Deliberately drives the same
-       entry points a click does -- app.currentPage, monitorPage.setGuest(),
-       refreshNow() -- so a scripted run exercises the real paths rather than a
+       entry points a click does -- app.currentPage, monitorPage.refreshNow()
+       -- so a scripted run exercises the real paths rather than a
        parallel set that could drift away from them.
        Placed after the mqtt Connections block, not inside it: dropping a
        Connections in the middle of another silently re-parents every handler
@@ -661,17 +661,11 @@ ApplicationWindow {
             if (verb === "page") {
                 app.currentPage = parseInt(arg)
             } else if (verb === "guest") {
-                if (arg === "host" || arg === "") {
-                    monitorPage.setGuest("", "", "", false)
-                } else {
-                    for (var i = 0; i < guestsModel.count; ++i) {
-                        var g = guestsModel.get(i)
-                        if (g.id === arg) {
-                            monitorPage.setGuest(g.id, g.name, g.ip, g.running)
-                            break
-                        }
-                    }
-                }
+                /* The Monitor page no longer has anything to select -- it
+                   shows the host plus every running guest on its own. "guest"
+                   just jumps there now; the argument only used to name which
+                   one to look at. */
+                app.currentPage = 3
             } else if (verb === "refresh") {
                 monitorPage.refreshNow()
             } else if (verb === "cmd") {
@@ -825,10 +819,10 @@ ApplicationWindow {
 
             GuestsPage {
                 mqtt: mqtt; app: app; guestsModel: guestsModel
-                onOpenMonitor: (id, name, ip, running) => {
-                    monitorPage.setGuest(id, name, ip, running);
-                    app.currentPage = 3;
-                }
+                /* The Monitor page shows every running guest on its own now,
+                   so opening it from a guest row just needs to switch tabs --
+                   there is nothing left to select. */
+                onOpenMonitor: (id, name, ip, running) => { app.currentPage = 3; }
             }
 
             OtaPage {
